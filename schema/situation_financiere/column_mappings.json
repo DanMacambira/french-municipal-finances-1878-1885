@@ -1,0 +1,18 @@
+{
+  "_note": "Fill only after reviewing original column headings. Year-specific layouts allow different numbers/meanings of columns. Positions are 1-based. No fields are discarded when unmapped.",
+  "_example_not_applied": {
+    "1881": {
+      "layouts": [
+        {
+          "name": "main",
+          "column_count": 8,
+          "columns": {
+            "1": {"name": "commune_printed", "type": "text"},
+            "2": {"name": "population", "type": "integer"},
+            "5": {"name": "centime_value_francs", "type": "decimal_fr"}
+          }
+        }
+      ]
+    }
+  }
+}

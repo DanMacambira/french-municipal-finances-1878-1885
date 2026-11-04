@@ -1,0 +1,34 @@
+# Original BnF PDF scans and other private/local source files
+/raw_data/
+*.pdf
+
+# Reproducible intermediates, OCR JSON, rendered pages, model outputs
+/derived/
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+
+# Secrets and local environments
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+.ipynb_checkpoints/
+
+# Large data artifacts must be deliberately released, not auto-committed
+*.parquet
+*.sqlite
+*.db
+*.zip
+
+# Do NOT ignore /data/*.csv (reviewed public outputs only).
