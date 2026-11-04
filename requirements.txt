@@ -1,6 +1,7 @@
-pymupdf>=1.24
+pymupdf==1.28.2
 pandas>=2.1
 pyarrow>=14
 requests>=2.31
 beautifulsoup4>=4.12
 pillow>=10
+mstrl_eAz8yHWjktjem2z8H4gPXHMHo6moLz6Z_36mtrl

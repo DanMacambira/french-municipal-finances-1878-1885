@@ -1,1 +1,60 @@
-{}
+{
+  "1878": {
+    "pdf": "La_Situation_financière_des_communes_1878.pdf",
+    "start": 446,
+    "end": 459,
+    "confirmed": true,
+    "status": "suggested"
+  },
+  "1879": {
+    "pdf": "La_Situation_financière_des_communes_1879.pdf",
+    "start": 448,
+    "end": 461,
+    "confirmed": true,
+    "status": "suggested"
+  },
+  "1880": {
+    "pdf": "La_Situation_financière_des_communes_1880.pdf",
+    "start": 271,
+    "end": 277,
+    "confirmed": true,
+    "status": "suggested"
+  },
+  "1881": {
+    "pdf": "La_Situation_financière_des_communes_1881.pdf",
+    "start": 452,
+    "end": 466,
+    "confirmed": true,
+    "status": "no_heading_found"
+  },
+  "1882": {
+    "pdf": "La_Situation_financière_des_communes_1882.pdf",
+    "start": 244,
+    "end": 252,
+    "confirmed": true,
+    "status": "no_heading_found",
+    "page_sides": {"244": ["right"]}
+  },
+  "1883": {
+    "pdf": "La_Situation_financière_des_communes_1883.pdf",
+    "start": 485,
+    "end": 502,
+    "confirmed": true,
+    "status": "no_heading_found"
+  },
+  "1884": {
+    "pdf": "La_Situation_financière_des_communes_1884.pdf",
+    "start": 490,
+    "end": 508,
+    "confirmed": true,
+    "status": "suggested"
+  },
+  "1885": {
+    "pdf": "La_Situation_financière_des_communes_1885.pdf",
+    "start": 262,
+    "end": 272,
+    "confirmed": true,
+    "status": "suggested",
+    "page_sides": {"262": ["right"], "272": ["left"]}
+  }
+}

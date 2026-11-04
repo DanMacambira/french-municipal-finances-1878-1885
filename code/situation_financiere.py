@@ -7,8 +7,8 @@ STAGES
   discover   Scan national PDFs locally; draft page ranges without any API calls.
   preview    Make contact sheets to check a page range visually.
   plan       Estimate confirmed regional pages and standard API call cost.
-  ocr        Render ONLY confirmed Pas-de-Calais pages, split into halves,
-             call Mistral (or local Tesseract), and cache every response.
+  ocr        Render ONLY confirmed Pas-de-Calais pages: full single-page scans
+             or selected halves of double-page spreads, and cache OCR results.
   build      Parse all cached HTML tables, preserve original cells, optionally
              apply year/layout-specific column mappings, then match communes.
 
@@ -152,9 +152,10 @@ def discover(args) -> None:
             entry = existing.get(str(year), {})
             # Existing reviewed ranges are never overwritten by auto-discovery.
             if not entry.get("confirmed", False):
-                existing[str(year)] = {"pdf": pdfs[year].name, "start": start,
-                                       "end": end, "confirmed": False,
-                                       "status": status}
+                # Preserve hand-entered half-page exclusions across discovery runs.
+                existing[str(year)] = {**entry, "pdf": pdfs[year].name,
+                                       "start": start, "end": end,
+                                       "confirmed": False, "status": status}
             suggestions.append({"year": year, "pages": len(pdf), "heading_hits": len(starts),
                                 "first_hit": starts[0] if starts else None,
                                 "last_hit": starts[-1] if starts else None,
@@ -183,6 +184,101 @@ def valid_range(year: int, pdf: fitz.Document) -> tuple[int, int]:
     return a, b
 
 
+def sides_for_page(year: int, page_no: int) -> tuple[str, ...]:
+    """Logical halves of a scanned PDF page belonging to the target department.
+
+    Both halves are included by default. Configure exceptional boundary pages
+    in page_ranges.json using, e.g., "page_sides": {"244": ["right"]}.
+    This keeps the full source PDF and its 1-based page numbering intact.
+    """
+    spec = read_json(RANGES, {}).get(str(year), {})
+    overrides = spec.get("page_sides", {})
+    selected = overrides.get(str(page_no), ["left", "right"])
+    if (not isinstance(selected, list) or not selected or
+            any(side not in ("left", "right") for side in selected) or
+            len(selected) != len(set(selected))):
+        raise ValueError(f"{year} PDF page {page_no}: invalid page_sides {selected!r}")
+    return tuple(side for side in ("left", "right") if side in selected)
+
+
+def printed_page_regions(year: int, page_no: int, page: fitz.Page) -> tuple[str, ...]:
+    """Choose a full scan or its left/right printed pages, without OCR.
+
+    'auto' classifies using PDF page geometry, NOT the scanned image content.
+    Use scan_layout / scan_layout_overrides to correct misclassified scans.
+    The page_sides option continues to apply only to two-page spreads.
+    """
+    spec = read_json(RANGES, {}).get(str(year), {})
+    overrides = spec.get("scan_layout_overrides", {})
+    layout = overrides.get(str(page_no), spec.get("scan_layout", "auto"))
+    if layout not in ("auto", "single", "spread"):
+        raise ValueError(f"{year} PDF page {page_no}: invalid scan_layout {layout!r}")
+    if layout == "auto":
+        # Strongly landscape PDF sheets are likely to be scanned two-page spreads.
+        # This is a heuristic: the operator must review preview --regions.
+        layout = "spread" if page.rect.width > page.rect.height * 1.05 else "single"
+    if layout == "single":
+        if str(page_no) in spec.get("page_sides", {}):
+            raise ValueError(f"{year} PDF page {page_no}: page_sides requires a spread; "
+                             "set scan_layout_overrides for this page if needed")
+        return ("full",)
+    return sides_for_page(year, page_no)
+
+
+def table_panels_for_page(year: int, page_no: int) -> int:
+    """The number of parallel printed table blocks on each printed page.
+
+    Set table_panels=2 (or a per-page override) ONLY after visually checking.
+    Default 1 preserves previous extraction behaviour and cache names.
+    """
+    spec = read_json(RANGES, {}).get(str(year), {})
+    overrides = spec.get("table_panel_overrides", {})
+    count = overrides.get(str(page_no), spec.get("table_panels", 1))
+    if type(count) is not int or count not in (1, 2):
+        raise ValueError(f"{year} PDF page {page_no}: table_panels must be 1 or 2, got {count!r}")
+    return count
+
+
+def table_panel_split_for_page(year: int, page_no: int, region: str) -> float:
+    """Position of the divider between two printed tables, as a width fraction.
+
+    Defaults to 0.5; optional config overrides are keyed by PDF page + physical
+    region, e.g. table_panel_split_overrides: {"p245_left": 0.521}.
+    Inspect the actual crops before OCR; printed tables are not always centered.
+    """
+    spec = read_json(RANGES, {}).get(str(year), {})
+    overrides = spec.get("table_panel_split_overrides", {})
+    split = overrides.get(f"p{page_no}_{region}", spec.get("table_panel_split", 0.5))
+    if isinstance(split, bool) or not isinstance(split, (int, float)) or not 0.35 < split < 0.65:
+        raise ValueError(f"{year} PDF page {page_no} {region}: invalid table panel split {split!r}")
+    return float(split)
+
+
+def region_signature(year: int, page_no: int, region: str) -> str | None:
+    """Detect whether the crop configuration has changed since the OCR run.
+
+    Legacy unsplit regions have no signature, preserving their previous cache.
+    """
+    match = re.fullmatch(r"(full|left|right)_col[12]", region)
+    if not match:
+        return None
+    payload = {"region": region,
+               "split": table_panel_split_for_page(year, page_no, match.group(1)),
+               "overlap_fraction": 0.007}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def regions_for_page(year: int, page_no: int, page: fitz.Page) -> tuple[str, ...]:
+    """Physical printed pages, optionally split again into parallel table columns.
+
+    Identifiers are stable provenance/cache keys, e.g. full_col1, right_col2.
+    """
+    base = printed_page_regions(year, page_no, page)
+    if table_panels_for_page(year, page_no) == 1:
+        return base
+    return tuple(f"{region}_col{part}" for region in base for part in (1, 2))
+
+
 def plan(args) -> None:
     """Count only approved regional pages; never send an API request."""
     pdfs = find_pdfs()
@@ -191,12 +287,20 @@ def plan(args) -> None:
         with fitz.open(pdfs[year]) as pdf:
             a, b = valid_range(year, pdf)
             count = b - a + 1
-            totals.append((year, a, b, count, count * 2))
-    print("Year | First PDF page | Last PDF page | Pages | Half-page OCR requests")
-    for row in totals:
-        print("%4d | %14d | %13d | %5d | %22d" % row)
+            regions = [regions_for_page(year, p, pdf[p - 1]) for p in range(a, b + 1)]
+            singles = sum(printed_page_regions(year, p, pdf[p - 1]) == ("full",)
+                          for p in range(a, b + 1))
+            spreads = count - singles
+            requests = sum(len(r) for r in regions)
+            totals.append((year, a, b, count, singles, spreads, requests))
+    print("Year | First | Last | PDF pages | Single scans | Spreads | OCR requests")
+    for year, a, b, count, singles, spreads, requests in totals:
+        print(f"{year:4d} | {a:5d} | {b:4d} | {count:9d} | {singles:12d} | "
+              f"{spreads:7d} | {requests:12d}")
     n_requests = sum(x[-1] for x in totals)
-    print(f"Total: {sum(x[-2] for x in totals)} source pages, {n_requests} image OCR requests")
+    print(f"Total: {sum(x[3] for x in totals)} source pages, {n_requests} image OCR requests")
+    print("Auto layout is based on page aspect ratio, not an inspection of the printed content. "
+          "Review make preview SF_ARGS='--regions ...' before paying for OCR.")
     print(f"Illustrative Mistral 4.1 standard list price at $4/1,000 pages: "
           f"USD {n_requests * .004:.2f} (not Batch API).")
     print("This assumes each separately submitted image is billed as one page; "
@@ -213,33 +317,64 @@ def preview(args) -> None:
             else:
                 start, end = valid_range(year, pdf)
             pages = list(range(start, end + 1, max(1, args.every)))
+            # --regions previews the ACTUAL images selected for the OCR call.
+            # The ordinary preview continues to show unchanged source PDF pages.
+            items = ([(p, side) for p in pages
+                      for side in regions_for_page(year, p, pdf[p - 1])]
+                     if args.regions else [(p, None) for p in pages])
             width, height = 380, 570
             columns = 4
-            canvas = Image.new("RGB", (columns * width, ((len(pages) + 3) // 4) * height), "white")
+            canvas = Image.new("RGB", (columns * width, ((len(items) + 3) // 4) * height), "white")
             draw = ImageDraw.Draw(canvas)
-            for j, p in enumerate(pages):
-                pix = pdf[p - 1].get_pixmap(matrix=fitz.Matrix(0.75, 0.75), alpha=False)
-                image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            for j, (p, side) in enumerate(items):
+                if side is None:
+                    pix = pdf[p - 1].get_pixmap(matrix=fitz.Matrix(0.75, 0.75), alpha=False)
+                    image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                else:
+                    _, img_path = render_regions(pdf[p - 1], year, p, 96, (side,))[0]
+                    with Image.open(img_path) as im:
+                        image = im.convert("RGB")
                 image.thumbnail((width - 20, height - 48))
                 x, y = (j % columns) * width + 10, (j // columns) * height + 25
                 canvas.paste(image, (x, y))
-                draw.text((x, y - 18), f"{year} / PDF p.{p}", fill="black")
-            out = DERIVED / "previews" / f"{year}_p{start}-{end}.jpg"
+                suffix = f" / {side}" if side else ""
+                draw.text((x, y - 18), f"{year} / PDF p.{p}{suffix}", fill="black")
+            postfix = "_regions" if args.regions else ""
+            out = DERIVED / "previews" / f"{year}_p{start}-{end}{postfix}.jpg"
             out.parent.mkdir(parents=True, exist_ok=True)
             canvas.save(out, quality=85)
             print(f"Wrote {out}")
 
 
-def render_halves(page: fitz.Page, year: int, page_no: int, dpi: int) -> list[tuple[str, Path]]:
+def render_regions(page: fitz.Page, year: int, page_no: int, dpi: int,
+                   sides: tuple[str, ...]) -> list[tuple[str, Path]]:
+    """Render complete printed-page images; originals remain unchanged."""
     w, h = page.rect.width, page.rect.height
     mid = w / 2
-    parts = {"left": fitz.Rect(0, 0, mid + w * .008, h),
+    parts = {"full": page.rect,
+             "left": fitz.Rect(0, 0, mid + w * .008, h),
              "right": fitz.Rect(mid - w * .008, 0, w, h)}
     rendered = []
-    for side, box in parts.items():
+    for side in sides:
+        match = re.fullmatch(r"(full|left|right)(?:_col([12]))?", side)
+        if not match:
+            raise ValueError(f"Unknown OCR region {side!r}")
+        printed_region, panel = match.groups()
+        box = parts[printed_region]
+        if panel is not None:
+            # The divider is within the printed page, not necessarily at 50%.
+            midpoint = box.x0 + box.width * table_panel_split_for_page(
+                year, page_no, printed_region)
+            pad = box.width * .007
+            if panel == "1":
+                box = fitz.Rect(box.x0, box.y0, midpoint + pad, box.y1)
+            else:
+                box = fitz.Rect(midpoint - pad, box.y0, box.x1, box.y1)
         out = DERIVED / "images" / str(year) / f"p{page_no:04d}_{side}_{dpi}dpi.png"
         out.parent.mkdir(parents=True, exist_ok=True)
-        if not out.exists():
+        # Rerender panels: their split fraction is configurable. The OCR cache
+        # below compares hashes so an unchanged panel never causes a paid call.
+        if panel is not None or not out.exists():
             pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), clip=box,
                                   colorspace=fitz.csGRAY, alpha=False)
             pix.save(str(out))
@@ -309,12 +444,17 @@ def ocr(args) -> None:
                 end = min(end, start + args.max_pages - 1) if args.max_pages else end
                 requested = range(start, end + 1)
             for page_no in requested:
-                for side, image in render_halves(pdf[page_no - 1], year, page_no, args.dpi):
+                chosen_sides = regions_for_page(year, page_no, pdf[page_no - 1])
+                for side, image in render_regions(pdf[page_no - 1], year, page_no,
+                                                  args.dpi, chosen_sides):
                     out = DERIVED / "ocr" / args.engine / str(year) / f"p{page_no:04d}_{side}.json"
                     checksum = hashlib.sha256(image.read_bytes()).hexdigest()
+                    signature = region_signature(year, page_no, side)
                     old = read_json(out, {})
                     chosen_model = args.model if args.engine == "mistral" else "tesseract-local"
-                    if not args.force and old.get("image_sha256") == checksum and old.get("model") == chosen_model:
+                    if (not args.force and old.get("image_sha256") == checksum
+                            and old.get("model") == chosen_model
+                            and old.get("region_signature") == signature):
                         count_skipped += 1
                         continue
                     print(f"OCR {year}, PDF page {page_no}, {side}, engine={chosen_model}", flush=True)
@@ -322,6 +462,7 @@ def ocr(args) -> None:
                     atomic_json(out, {"year": year, "pdf_page": page_no, "side": side,
                                       "source_pdf": pdfs[year].name, "image": str(image.relative_to(ROOT)),
                                       "image_sha256": checksum, "model": chosen_model,
+                                      "region_signature": signature,
                                       "extracted_at_utc": datetime.now(timezone.utc).isoformat(),
                                       "response": response})
                     count_sent += 1
@@ -484,7 +625,27 @@ def layout_for(year: int, count: int, mappings: dict, page_no: int, side: str) -
     return candidates[0] if len(candidates) == 1 else None
 
 
-def parse_cache(engine: str, years: list[int] | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def active_ocr_regions(years: list[int] | None) -> dict[tuple[int, int, str], str]:
+    """Return permitted current regions, excluding superseded crops from build.
+
+    This prevents stale 'full' OCR from being mixed with replacement 'full_col1/2'
+    results after changing the table_panels configuration.
+    """
+    pdfs = find_pdfs()
+    active = {}
+    for year in (years if years is not None else sorted(pdfs)):
+        if year not in pdfs:
+            raise FileNotFoundError(f"Missing original PDF for {year}: cannot validate OCR cache")
+        with fitz.open(pdfs[year]) as pdf:
+            start, end = valid_range(year, pdf)
+            for page_no in range(start, end + 1):
+                for region in regions_for_page(year, page_no, pdf[page_no - 1]):
+                    active[(year, page_no, region)] = pdfs[year].name
+    return active
+
+
+def parse_cache(engine: str, years: list[int] | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    active = active_ocr_regions(years)
     mappings = read_json(MAPPINGS, {})
     raw_rows = []
     candidates = []
@@ -494,7 +655,18 @@ def parse_cache(engine: str, years: list[int] | None = None) -> tuple[pd.DataFra
     for path in sorted(directory.glob("*/p*_*.json")):
         record = read_json(path, {})
         year, page_no, side = record["year"], record["pdf_page"], record["side"]
-        if years is not None and year not in years:
+        # A previous OCR cache might be for an earlier crop/layout or an
+        # excluded department. Keep it on disk but never use it in build.
+        if active.get((year, page_no, side)) != record.get("source_pdf"):
+            continue
+        # Changing a table-panel split without rerunning OCR must not silently
+        # incorporate obsolete content in a research-ready candidate dataset.
+        if record.get("region_signature") != region_signature(year, page_no, side):
+            print(f"Skipping stale OCR crop {path}; rerun OCR for this page", file=sys.stderr)
+            continue
+        image_path = ROOT / str(record.get("image", ""))
+        if not image_path.is_file() or hashlib.sha256(image_path.read_bytes()).hexdigest() != record.get("image_sha256"):
+            print(f"Skipping changed/missing OCR image {path}; rerun OCR", file=sys.stderr)
             continue
         response = record.get("response", {})
         ocr_page = (response.get("pages") or [{}])[0]
@@ -662,6 +834,8 @@ def main() -> None:
             q.add_argument("--center", type=int, help="PDF page for a local contact sheet")
             q.add_argument("--radius", type=int, default=5)
             q.add_argument("--every", type=int, default=1, help="Use 2, 3, etc. for long ranges")
+            q.add_argument("--regions", action="store_true",
+                           help="Preview full/left/right images as they would be sent to OCR")
         if cmd == "ocr":
             q.add_argument("--engine", choices=("mistral", "tesseract"), default="mistral")
             q.add_argument("--model", default=MODEL, help="Pinned Mistral model ID")
