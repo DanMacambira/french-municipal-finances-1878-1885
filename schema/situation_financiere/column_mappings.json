@@ -7,12 +7,97 @@
           "name": "main",
           "column_count": 8,
           "columns": {
-            "1": {"name": "commune_printed", "type": "text"},
-            "2": {"name": "population", "type": "integer"},
-            "5": {"name": "centime_value_francs", "type": "decimal_fr"}
+            "1": {
+              "name": "commune_printed",
+              "type": "text"
+            },
+            "2": {
+              "name": "population",
+              "type": "integer"
+            },
+            "5": {
+              "name": "centime_value_francs",
+              "type": "decimal_fr"
+            }
           }
         }
       ]
     }
+  },
+  "1882": {
+    "layouts": [
+      {
+        "name": "printed_table_9_columns",
+        "column_count": 9,
+        "columns": {
+          "2": {
+            "name": "population",
+            "type": "integer"
+          },
+          "3": {
+            "name": "superficie_hectares",
+            "type": "integer"
+          },
+          "4": {
+            "name": "revenus_annuels_francs",
+            "type": "integer"
+          },
+          "5": {
+            "name": "valeur_centime_francs",
+            "type": "decimal_fr"
+          },
+          "6": {
+            "name": "centimes_total",
+            "type": "integer"
+          },
+          "7": {
+            "name": "centimes_extraordinaires_raw",
+            "type": "text"
+          },
+          "8": {
+            "name": "duree_impositions_extraordinaires_raw",
+            "type": "text"
+          },
+          "9": {
+            "name": "revenus_bureau_bienfaisance_raw",
+            "type": "text"
+          }
+        }
+      },
+      {
+        "name": "printed_table_8_columns_missing_bienfaisance",
+        "column_count": 8,
+        "columns": {
+          "2": {
+            "name": "population",
+            "type": "integer"
+          },
+          "3": {
+            "name": "superficie_hectares",
+            "type": "integer"
+          },
+          "4": {
+            "name": "revenus_annuels_francs",
+            "type": "integer"
+          },
+          "5": {
+            "name": "valeur_centime_francs",
+            "type": "decimal_fr"
+          },
+          "6": {
+            "name": "centimes_total",
+            "type": "integer"
+          },
+          "7": {
+            "name": "centimes_extraordinaires_raw",
+            "type": "text"
+          },
+          "8": {
+            "name": "duree_impositions_extraordinaires_raw",
+            "type": "text"
+          }
+        }
+      }
+    ]
   }
 }

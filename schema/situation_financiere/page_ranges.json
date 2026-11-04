@@ -33,7 +33,16 @@
     "end": 252,
     "confirmed": true,
     "status": "no_heading_found",
-    "page_sides": {"244": ["right"]}
+    "page_sides": {
+      "244": ["right"]
+    },
+    "table_panel_overrides": {
+      "245": 2
+    },
+    "table_panel_split_overrides": {
+      "p245_left": 0.521,
+      "p245_right": 0.485
+    }
   },
   "1883": {
     "pdf": "La_Situation_financière_des_communes_1883.pdf",
