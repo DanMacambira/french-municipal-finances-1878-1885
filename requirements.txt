@@ -4,4 +4,3 @@ pyarrow>=14
 requests>=2.31
 beautifulsoup4>=4.12
 pillow>=10
-mstrl_eAz8yHWjktjem2z8H4gPXHMHo6moLz6Z_36mtrl

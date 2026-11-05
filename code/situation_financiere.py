@@ -403,7 +403,10 @@ def api_ocr(image: Path, model: str) -> dict:
                 print(f"OCR HTTP {res.status_code}, retry in {delay}s")
                 time.sleep(delay)
                 continue
-            res.raise_for_status()
+            if not res.ok:
+                raise RuntimeError(
+                    f"Mistral OCR HTTP {res.status_code}: {res.text[:1500]}"
+                )
             return res.json()
         except requests.RequestException:
             if attempt == 4:
@@ -672,6 +675,8 @@ def parse_cache(engine: str, years: list[int] | None = None) -> tuple[pd.DataFra
         ocr_page = (response.get("pages") or [{}])[0]
         sources = table_sources(ocr_page)
         page_context = str(ocr_page.get("markdown", ""))
+        from territorial_validation import markdown_table_prefaces
+        prefaces = markdown_table_prefaces(page_context)
         page_audit.append({"year": year, "pdf_page": page_no, "side": side,
                            "source_pdf": record.get("source_pdf"),
                            "source_image": record.get("image"),
@@ -704,7 +709,8 @@ def parse_cache(engine: str, years: list[int] | None = None) -> tuple[pd.DataFra
                         "ocr_page_confidence": (ocr_page.get("confidence_scores") or {}).get(
                             "average_page_confidence_score"),
                         "raw_cells_json": json.dumps(cells, ensure_ascii=False),
-                        "ocr_markdown_excerpt": page_context[:500]}
+                        "ocr_markdown_excerpt": page_context[:500],
+                        "ocr_table_preface": prefaces.get(table_id, "")}
                 for k, cell in enumerate(cells, start=1):
                     base[f"raw_col_{k:02d}"] = cell
                 raw_rows.append(base)
@@ -733,7 +739,10 @@ def parse_cache(engine: str, years: list[int] | None = None) -> tuple[pd.DataFra
                             flags.append(f"{name}:{status}")
                 entry["extraction_flags"] = ";".join(flags)
                 candidates.append(entry)
-    return (pd.DataFrame(raw_rows), pd.DataFrame(candidates),
+    from territorial_validation import annotate_territories
+    raw_frame, candidate_frame = annotate_territories(
+        pd.DataFrame(raw_rows), pd.DataFrame(candidates))
+    return (raw_frame, candidate_frame,
             pd.DataFrame(inventory), pd.DataFrame(page_audit))
 
 
@@ -771,9 +780,27 @@ def build(args) -> None:
                            "Check OCR JSON responses; plain-text Tesseract is not enough.")
     export_frame(raw, output / "situation_financiere_all_rows.parquet")
     export_frame(inventory, output / "situation_financiere_column_inventory.parquet")
+    from territorial_validation import canton_subtotal_checks
+    expected = set(active_ocr_regions(args.years))
+    available = set()
+    if not page_audit.empty:
+        available = {(int(r.year), int(r.pdf_page), str(r.side))
+                     for r in page_audit.itertuples()
+                     if int(r.structured_tables_found) > 0}
+    canton_checks = canton_subtotal_checks(raw, communes,
+                                           expected_regions=expected,
+                                           available_regions=available)
+    export_frame(canton_checks, output / "situation_financiere_canton_validation.parquet")
     if communes.empty:
         print("No candidate commune rows. Review column_inventory and cached OCR.")
         return
+    # Parse tax pairs offline; unassigned continuation lines remain review items.
+    from extraordinary_tax_parser import enrich_with_extraordinary_taxes
+    communes, tax_entries, detached_tax_rows = enrich_with_extraordinary_taxes(communes, raw)
+    if not tax_entries.empty:
+        export_frame(tax_entries, output / "situation_financiere_extraordinary_tax_entries.parquet")
+    if not detached_tax_rows.empty:
+        export_frame(detached_tax_rows, output / "situation_financiere_unassigned_tax_rows.parquet")
     if not args.no_match:
         communes = apply_commune_match(communes)
     else:
@@ -782,6 +809,11 @@ def build(args) -> None:
     communes["verification_status"] = "ocr_unverified"
     counts = Counter((int(y), int(cid)) for y, cid in zip(communes["year"], communes["cassini_id"])
                      if pd.notna(cid))
+    mismatched_cantons = set()
+    if not canton_checks.empty:
+        mismatched_cantons = set(zip(
+            canton_checks.loc[canton_checks["status"] == "ocr_discrepancy_review_scan", "year"],
+            canton_checks.loc[canton_checks["status"] == "ocr_discrepancy_review_scan", "canton_segment_id"]))
     qa = []
     for row in communes.to_dict("records"):
         flags = [x for x in str(row.get("extraction_flags") or "").split(";") if x]
@@ -799,8 +831,18 @@ def build(args) -> None:
                     flags.append("low_page_ocr_confidence")
             except (ValueError, TypeError):
                 pass
+        tax_status = row.get("extraordinary_tax_pair_status", "")
+        if tax_status and tax_status != "ocr_pairs_complete_unverified":
+            flags.append(f"tax:{tax_status}")
+        if pd.isna(row.get("canton_segment_id")):
+            flags.append("missing_canton_context")
+        elif (int(row["year"]), int(row["canton_segment_id"])) in mismatched_cantons:
+            flags.append("canton_ocr_subtotal_discrepancy_review")
         qa.append({"row_id": row["row_id"], "year": row["year"],
                    "cassini_id": cid, "commune_raw": row["commune_raw"],
+                   "arrondissement": row.get("arrondissement"),
+                   "canton": row.get("canton"),
+                   "canton_segment_id": row.get("canton_segment_id"),
                    "pdf_page": row["pdf_page"], "source_image": row["source_image"],
                    "review_flags": ";".join(sorted(set(flags)))})
     qa_frame = pd.DataFrame(qa)

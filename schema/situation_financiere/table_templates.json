@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "templates": {
+    "1882": {
+      "pdf": "La_Situation_financière_des_communes_1882.pdf",
+      "reference_page": 245,
+      "coordinate_system": "relative_to_entire_pdf_scan",
+      "transfer_method": "normalized_only_unverified",
+      "regions": [
+        {
+          "name": "table_1",
+          "box": [
+            0.002718,
+            0.061617,
+            0.267995,
+            0.939607
+          ]
+        },
+        {
+          "name": "table_2",
+          "box": [
+            0.26316,
+            0.053407,
+            0.500239,
+            0.940742
+          ]
+        },
+        {
+          "name": "table_3",
+          "box": [
+            0.500668,
+            0.053465,
+            0.739749,
+            0.937922
+          ]
+        },
+        {
+          "name": "table_4",
+          "box": [
+            0.739749,
+            0.054684,
+            1.0,
+            0.937922
+          ]
+        }
+      ]
+    }
+  }
+}
