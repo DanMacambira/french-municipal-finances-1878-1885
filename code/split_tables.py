@@ -14,6 +14,8 @@ import argparse
 import csv
 import hashlib
 import re
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,8 +26,8 @@ from PIL import Image, ImageDraw
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_INPUT = ROOT / "derived" / "situation_financiere" / "split_pages"
 DEFAULT_OUTPUT = ROOT / "derived" / "situation_financiere" / "table_panels"
-VERSION = "vertical_rule_to_names_adaptive_v1_1"
-PATTERN = re.compile(r"^p(?P<page>\d{4})_(?P<side>left|right)_(?P<dpi>\d+)dpi\.png$")
+VERSION = "layout_guided_table_split_v1_5"
+PATTERN = re.compile(r"^p(?P<page>\d{4})_(?P<side>left|right|single)_(?P<dpi>\d+)dpi\.png$")
 
 
 @dataclass(frozen=True)
@@ -159,6 +161,187 @@ def detect_separator(image: Image.Image, *, min_fraction: float = .42,
                      accepted, reason)
 
 
+
+def layout_bucket(page: int, side: str) -> str:
+    """Use the side of a spread, or PDF-page parity on single-page scans."""
+    if side in {"left", "right"}:
+        return side
+    return f"single_{page % 2}"
+
+
+def layout_priors(sources: list[tuple[int, str, Path]],
+                  initial: dict[Path, Separator]) -> dict[str, float]:
+    """Robust per-year positions from the already-accepted pages only.
+
+    A prior guides a local image search; it NEVER authorizes cropping by itself.
+    A dispersion check prevents using a misleading page-parity assumption.
+    """
+    groups: dict[str, list[float]] = {}
+    for page, side, path in sources:
+        result = initial[path]
+        if result.accepted and result.strength >= .08:
+            groups.setdefault(layout_bucket(page, side), []).append(result.fraction)
+    priors: dict[str, float] = {}
+    for bucket, values in groups.items():
+        if len(values) < 2:
+            continue
+        m = float(np.median(values))
+        median_deviation = float(np.median(np.abs(np.asarray(values) - m)))
+        if median_deviation <= .024 and .40 <= m <= .60:
+            priors[bucket] = m
+    return priors
+
+
+def detect_separator_tolerant(image: Image.Image, expected: float) -> Separator | None:
+    """Second detector, restricted to a previously learned local neighborhood.
+
+    Unlike a coordinate template, the expected fraction is only a prior. A cut
+    requires a detected long rule and independent left/right layout evidence.
+    """
+    if not .40 <= expected <= .60:
+        return None
+    gray = _resize(np.asarray(image.convert("L"), dtype=np.uint8))
+    h, w = gray.shape
+    enhanced = cv2.createCLAHE(clipLimit=2., tileGridSize=(8, 8)).apply(gray)
+    binary = cv2.threshold(enhanced, 0, 255,
+                           cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+    # Shorter than the strict detector, but still longer than most characters.
+    length = max(13, round(h * .017))
+    rules = cv2.morphologyEx(binary, cv2.MORPH_OPEN,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (1, length)))
+    profile = (rules[round(h*.08):round(h*.88)] > 0).mean(axis=0).astype(np.float32)
+    profile = cv2.GaussianBlur(profile.reshape(1, -1), (0, 0), sigmaX=1.6)[0]
+    lower = max(0, round((expected - .032) * w))
+    upper = min(w, round((expected + .032) * w))
+    candidates = _candidate_peaks(profile, lower, upper)
+    # Check several row bands because introductory pages have the column
+    # heading substantially lower than ordinary pages.
+    bands = [( .07, .25), (.21, .39), (.38, .56), (.55, .74)]
+    results = []
+    for x in candidates:
+        if abs(x/w - expected) > .032:
+            continue
+        line_strength = float(profile[x])
+        if line_strength < .040:
+            continue
+        left_support = 0.0
+        right_support = 0.0
+        good_bands = 0
+        active_bands = 0
+        for ya, yb in bands:
+            line_profile = (rules[round(h*ya):round(h*yb)] > 0).mean(axis=0).astype(np.float32)
+            # The separator is between dense fiscal rules on its left, and
+            # the rule-free NOMS column for the next table on its right.
+            lo1, hi1 = max(0, x-round(w*.083)), max(0, x-round(w*.018))
+            lo2, hi2 = min(w, x+round(w*.018)), min(w, x+round(w*.083))
+            left = float(line_profile[lo1:hi1].sum())
+            right = float(line_profile[lo2:hi2].sum())
+            local = float(line_profile[max(0,x-3):min(w,x+4)].max())
+            if local > .06:
+                active_bands += 1
+            if local > .06 and left >= .22 and left >= 2.2 * max(right, .05) and left-right >= .18:
+                good_bands += 1
+            left_support += left
+            right_support += right
+        if good_bands < 2 or active_bands < 3:
+            continue
+        # Prefer rules close to the expected page-side position, not an
+        # unrelated fiscal-column rule just inside the search band.
+        distance = abs(x / w - expected)
+        quality = (line_strength * (1. + .22 * good_bands)
+                   * np.exp(-.5 * (distance / .020) ** 2))
+        results.append((float(quality), x, line_strength,
+                        left_support, right_support, good_bands))
+    if not results:
+        return None
+    results.sort(reverse=True)
+    top = results[0]
+    competitor = next((r for r in results[1:] if abs(r[1] - top[1]) > w*.012), None)
+    if competitor is not None and top[0] < competitor[0] * 1.20:
+        return None
+    cut_x = int(top[1])
+    # A genuinely drifting printed rule is recovered by the already existing
+    # robust linear/quadratic path fitter, not by increasing guessed margins.
+    drift = _line_drift(rules, cut_x)
+    if not np.isfinite(drift) or drift > .024:
+        return None
+    confidence = min(.95, max(.15, top[5]/4 * top[2]/.15))
+    return Separator(cut_x/w, top[2], top[3], top[4],
+                     float(competitor[0] if competitor else 0.), confidence,
+                     drift, True, "recovered_tolerant_header_rule")
+
+
+def detect_single_table_side(image: Image.Image) -> str | None:
+    """Recognize a truly blank parallel half, never guess from a missing rule.
+
+    Both activity and long printed vertical rules must be strongly one-sided.
+    Ordinary pages with two tables (including half-filled last pages) remain
+    two-table pages even if the bottom of both tables is blank.
+    """
+    gray = _resize(np.asarray(image.convert("L"), dtype=np.uint8))
+    h, w = gray.shape
+    bw = (gray < 165).astype(np.uint8) * 255
+    rules = cv2.morphologyEx(bw, cv2.MORPH_OPEN,
+                             cv2.getStructuringElement(cv2.MORPH_RECT,
+                                                      (1, max(15, round(h*.018)))))
+    ink = []
+    vertical = []
+    for l, r in ((.10, .38), (.63, .91)):
+        x1, x2 = round(w*l), round(w*r)
+        area = bw[round(h*.10):round(h*.86), x1:x2]
+        varea = rules[round(h*.10):round(h*.86), x1:x2]
+        ink.append(float((area > 0).mean()))
+        vertical.append(float((varea > 0).mean()))
+    # A clean white half must differ dramatically from a ruled table half.
+    # The thresholds deliberately prioritize not losing a genuine second table.
+    for i, side in enumerate(("left", "right")):
+        other = 1-i
+        if (ink[i] >= .012 and vertical[i] >= .009
+            and ink[other] <= .0015 and vertical[other] <= .0004
+            and ink[i] >= 12 * max(ink[other], .0001)):
+            return side
+    return None
+
+
+def aggregate_review_csvs(output_root: Path) -> Path:
+    """Concatenate all year-level table reports into one reproducible CSV.
+
+    The aggregate is refreshed after each run, contains every available year,
+    and is written atomically. It never takes data from images or OCR caches.
+    """
+    files = sorted(output_root.glob("[0-9][0-9][0-9][0-9]/table_split_review.csv"))
+    if not files:
+        raise FileNotFoundError(f"No annual table_split_review.csv files under {output_root}")
+    merged: list[dict[str, str]] = []
+    fields: list[str] = []
+    for file in files:
+        with file.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for name in reader.fieldnames or []:
+                if name not in fields:
+                    fields.append(name)
+            for row in reader:
+                if row.get("year") and row.get("pdf_page"):
+                    merged.append(row)
+    side_order = {"single":0, "left":1, "right":2}
+    merged.sort(key=lambda r: (int(r["year"]), int(r["pdf_page"]),
+                               side_order.get(r.get("printed_side", ""), 9)))
+    target = output_root / "all_years_table_split_review.csv"
+    output_root.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".table_split_", suffix=".csv", dir=output_root)
+    try:
+        with os.fdopen(fd, "w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(merged)
+        os.replace(tmp, target)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    return target
+
+
+
 @dataclass(frozen=True)
 class CutPath:
     """x-coordinate as a fraction of width, polynomial in normalized height [-1, 1]."""
@@ -168,10 +351,353 @@ class CutPath:
     residual_fraction: float
     max_shift_fraction: float
     reason: str
+    active_y_range: tuple[float, float] | None = None
 
     def fractions(self, height: int) -> np.ndarray:
         y = (np.arange(height, dtype=np.float64) + .5) * (2. / height) - 1.
+        if self.active_y_range is not None:
+            # Do not extrapolate a fitted curve through blank paper below a
+            # short table. Hold the last observed boundary position instead.
+            y = np.clip(y, *self.active_y_range)
         return np.polyval(self.coefficients, y)
+
+
+
+
+def _extreme_fit(ys: np.ndarray, xs: np.ndarray, degree: int
+                 ) -> tuple[np.ndarray, np.ndarray, float] | None:
+    """Robust fit for a *strongly slanted* detected rule, not generic pixels.
+
+    This is deliberately separate from _fit_robust, so strict/tolerant
+    detections continue to use exactly the v1.3 limits and behavior.
+    """
+    if len(xs) < 10:
+        return None
+    keep = np.ones(len(xs), dtype=bool)
+    for _ in range(4):
+        if keep.sum() < 9:
+            return None
+        coef = np.polyfit(ys[keep], xs[keep], degree)
+        err = np.abs(xs - np.polyval(coef, ys))
+        updated = err <= .007
+        if updated.sum() < max(9, round(len(xs) * .65)):
+            break
+        keep = updated
+    if keep.sum() < max(9, round(len(xs) * .65)) or np.ptp(ys[keep]) < 1.25:
+        return None
+    coef = np.polyfit(ys[keep], xs[keep], degree)
+    residual = float(np.sqrt(np.mean((xs[keep] - np.polyval(coef, ys[keep]))**2)))
+    return coef, keep, residual
+
+
+def _extreme_path_from_samples(ys: np.ndarray, xs: np.ndarray,
+                               expected: float) -> CutPath | None:
+    """Test vertical/linear/quadratic hypotheses with expanded limits.
+
+    No candidate is accepted simply because a high-degree polynomial fits:
+    the source samples have to come from a traced printed rule and span
+    most of the page. Quadratic requires a meaningful improvement on linear.
+    """
+    if len(xs) < 10 or np.ptp(ys) < 1.25:
+        return None
+    baseline = float(np.sqrt(np.mean((xs - np.median(xs))**2)))
+    fits: dict[str, tuple[np.ndarray, np.ndarray, float]] = {}
+    for name, degree in (("linear", 1), ("quadratic", 2)):
+        fit = _extreme_fit(ys, xs, degree)
+        if fit is not None:
+            fits[name] = fit
+    if not fits:
+        return None
+    straight = fits.get("linear")
+    curved = fits.get("quadratic")
+    # A genuinely near-vertical trace is preferable to any polynomial fit.
+    if baseline <= .0028:
+        coef = np.array([float(np.median(xs))])
+        kind, residual, count = "vertical", baseline, len(xs)
+    elif straight is not None and straight[2] <= .0065:
+        coef, keep, residual = straight
+        kind, count = "linear", int(keep.sum())
+    elif curved is not None and curved[2] <= .0065:
+        coef, keep, residual = curved
+        kind, count = "quadratic", int(keep.sum())
+    else:
+        return None
+    if curved is not None and curved[2] <= .0065:
+        curve_coef, curve_keep, curve_error = curved
+        if straight is None:
+            better = baseline - curve_error > .002
+        else:
+            line_error = straight[2]
+            sample_y = np.linspace(-1., 1., 80)
+            curve_size = float(np.max(np.abs(np.polyval(curve_coef, sample_y)
+                                               - np.polyval(straight[0], sample_y))))
+            better = (line_error - curve_error > .0012 and
+                      curve_error <= .7 * line_error and curve_size >= .003)
+        if better:
+            coef, residual = curve_coef, curve_error
+            kind, count = "quadratic", int(curve_keep.sum())
+    sampled = np.polyval(coef, np.linspace(-1., 1., 101))
+    span = float(np.ptp(sampled))
+    shift = float(np.max(np.abs(sampled - expected)))
+    midpoint = float(np.polyval(coef, 0.))
+    if (residual > .0065 or span > .145 or shift > .092
+            or abs(midpoint-expected) > .040
+            or np.min(sampled) <= .36 or np.max(sampled) >= .64):
+        return None
+    return CutPath(kind, tuple(float(x) for x in coef), count,
+                   float(residual), shift, "verified_extreme_rule_trace")
+
+
+def detect_separator_extreme(image: Image.Image, expected: float
+                             ) -> tuple[Separator, CutPath] | None:
+    """Third-pass *review-only* boundary detection from local rule evidence.
+
+    Unlike v1.3's full-height vertical profile, this works on 17 independent
+    horizontal strips: the same slanted rule may move across X between strips.
+    A robust trace must have a fiscal-column-to-wide-NOMS transition near its
+    top, long-rule evidence across the page, and a stable fitted geometry.
+    A location prior is a search constraint, NEVER proof of a separator.
+    """
+    if not .40 <= expected <= .60:
+        return None
+    gray = _resize(np.asarray(image.convert("L"), dtype=np.uint8))
+    h, w = gray.shape
+    enhanced = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    binary = cv2.threshold(enhanced, 0, 255,
+                           cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+    # Short rules survive gentle slant; text strokes are mostly suppressed.
+    rules = cv2.morphologyEx(binary, cv2.MORPH_OPEN,
+                            cv2.getStructuringElement(
+                                cv2.MORPH_RECT, (1, max(9, round(h * .012)))))
+    centers = np.linspace(.105, .895, 17)
+    band_data: list[list[tuple[int, float, float, float]]] = []
+    left_limit = max(3, round((expected - .095) * w))
+    right_limit = min(w-3, round((expected + .095) * w))
+    for cy in centers:
+        half = max(12, round(h * .033))
+        y = round(cy * h)
+        density = (rules[max(0, y-half):min(h, y+half)] > 0).mean(axis=0).astype(np.float32)
+        smooth = cv2.GaussianBlur(density.reshape(1, -1), (0, 0), sigmaX=1.5)[0]
+        # One detector applied afresh to every strip; no template transfer.
+        peaks = _candidate_peaks(smooth, left_limit, right_limit)
+        options = []
+        for x in peaks:
+            strength = float(smooth[x])
+            if strength < .055:
+                continue
+            la, lb = max(0, x-round(w*.10)), max(0, x-round(w*.016))
+            ra, rb = min(w, x+round(w*.016)), min(w, x+round(w*.105))
+            before = float(smooth[la:lb].sum())
+            after = float(smooth[ra:rb].sum())
+            # This differentiates the table separator from internal fiscal rules.
+            signature = (before >= .20 and before-after >= .16 and
+                         before >= 1.7 * max(after, .07))
+            if abs(x / w - expected) > .095:
+                continue
+            options.append((x, strength, before, after, bool(signature)))
+        band_data.append(options)
+
+    # Start from independent header-like evidence in the upper half of the
+    # page; follow across bands with a predictor that tolerates strong drift.
+    seeds = []
+    for i, cy in enumerate(centers):
+        if cy > .40:
+            break
+        for x, strength, before, after, signature in band_data[i]:
+            if signature and abs(x/w - expected) <= .07:
+                merit = strength * (1 + min(2., (before-after)/max(before, .1)))
+                merit *= float(np.exp(-.5 * ((x/w-expected)/.06)**2))
+                seeds.append((merit, i, x))
+    if not seeds:
+        return None
+    seeds.sort(reverse=True)
+    candidates = []
+    for _, seed_i, seed_x in seeds[:12]:
+        selected: dict[int, tuple[int, float, float, float, bool]] = {}
+        selected[seed_i] = next(item for item in band_data[seed_i] if item[0] == seed_x)
+        for direction in (-1, 1):
+            last_points = [(seed_i, seed_x)]
+            for i in range(seed_i+direction, len(centers) if direction > 0 else -1, direction):
+                # Estimate local trend where possible, but heavily constrain
+                # jumps to avoid switching to a neighbouring fiscal column.
+                prev_i, prev_x = last_points[-1]
+                slope = ((last_points[-1][1]-last_points[-2][1]) /
+                         (last_points[-1][0]-last_points[-2][0])) if len(last_points)>=2 else 0.
+                slope = float(np.clip(slope, -w*.019, w*.019))
+                predicted = prev_x + slope*(i-prev_i)
+                limit = w * .025 * max(1, abs(i-prev_i))
+                local = [o for o in band_data[i] if abs(o[0]-predicted) <= limit]
+                if not local:
+                    continue
+                def quality(option):
+                    x, strength, before, after, signature = option
+                    proximity = float(np.exp(-.5*((x-predicted)/(w*.014*max(1,abs(i-prev_i))))**2))
+                    return strength*proximity*(1.18 if signature else 1.0)
+                best = max(local, key=quality)
+                if quality(best) < .032:
+                    continue
+                selected[i] = best
+                last_points.append((i,best[0]))
+        if len(selected) < 10:
+            continue
+        ordered = sorted(selected)
+        ys = np.asarray([2*centers[i]-1 for i in ordered], dtype=np.float64)
+        xs = np.asarray([selected[i][0]/w for i in ordered], dtype=np.float64)
+        header = sum(bool(selected[i][4]) for i in ordered if centers[i] <= .40)
+        if header < 2 or np.ptp(ys) < 1.3:
+            continue
+        path = _extreme_path_from_samples(ys, xs, expected)
+        if path is None:
+            continue
+        # The path must remain close to observed rule pixels, not merely fit
+        # a few isolated high-contrast features.
+        residuals = np.abs(xs-np.polyval(path.coefficients, ys))
+        if int((residuals <= .010).sum()) < 10:
+            continue
+        strength = float(np.median([selected[i][1] for i in ordered]))
+        if strength < .07:
+            continue
+        score = (len(ordered)/len(centers) + header/10. + .6*strength
+                 - 8*path.residual_fraction - 1.0*abs(float(np.median(xs))-expected))
+        candidates.append((score, path, selected, ys, xs, header, strength))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    top = candidates[0]
+    # Resolve genuinely different tracked separators; competing solutions are
+    # evidence of ambiguity, not permission to guess.
+    mid = float(np.polyval(top[1].coefficients, 0.))
+    for other in candidates[1:]:
+        other_mid = float(np.polyval(other[1].coefficients, 0.))
+        if abs(other_mid-mid) > .014 and other[0] >= top[0]-.07:
+            return None
+    _, path, points, ys, xs, header, strength = top
+    result = Separator(mid, strength, float(header), 0., 0.,
+                       min(.85, .35+.035*len(points)),
+                       float(np.ptp(xs)), True, "recovered_extreme_rule_trace")
+    return result, path
+
+
+
+def _short_table_active_region(image: Image.Image, expected: float
+                               ) -> tuple[float, float] | None:
+    """Find a well-supported *shared* table area ending before the page bottom.
+
+    Count long printed rules in both tables, away from the page-edge shadows
+    and away from the central separator. A dark crease, arbitrary text, or one
+    populated half is insufficient to establish two short parallel tables.
+    This is used ONLY after three existing passes failed.
+    """
+    if not .40 <= expected <= .60:
+        return None
+    gray = _resize(np.asarray(image.convert("L"), dtype=np.uint8))
+    h, w = gray.shape
+    enhanced = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    binary = cv2.threshold(enhanced, 0, 255,
+                           cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+    rules = cv2.morphologyEx(binary, cv2.MORPH_OPEN,
+                             cv2.getStructuringElement(
+                                 cv2.MORPH_RECT, (1, max(11, round(h * .012))))) > 0
+    windows = ((round(w * .11), round(w * (expected - .04))),
+               (round(w * (expected + .10)), round(w * .89)))
+    bounds: list[tuple[int, int]] = []
+    indices = np.arange(h)
+    length = max(5, round(h * .012))
+    kernel = np.ones(length, dtype=np.float64) / length
+    for a, b in windows:
+        if b-a < round(w * .14):
+            return None
+        density = rules[:, a:b].mean(axis=1)
+        activity = np.convolve(density, kernel, mode="same")
+        typical = float(np.quantile(activity[round(h*.09):round(h*.45)], .75))
+        if typical < .008:  # No reliable collection of printed column rules.
+            return None
+        threshold = max(.0035, typical * .17)
+        eligible = ((activity > threshold) & (indices >= round(h * .045))
+                    & (indices <= round(h * .91)))
+        active = np.flatnonzero(eligible)
+        if len(active) < round(h * .23):
+            return None
+        first, last = int(active[0]), int(active[-1])
+        if (last-first < round(h*.26) or
+                float(eligible[first:last+1].mean()) < .58):
+            return None
+        bounds.append((first, last))
+    top = min(pair[0] for pair in bounds)
+    bottom = max(pair[1] for pair in bounds)
+    # Require both sides to begin around the header and end together. A
+    # full-height scan is NOT a short table even if one side is shorter.
+    if (top > h*.23 or bottom < h*.37 or bottom > h*.79
+            or abs(bounds[0][1]-bounds[1][1]) > h*.12):
+        return None
+    y0 = max(0, top-round(h*.018))
+    y1 = min(h, bottom+round(h*.023))
+    return y0/h, y1/h
+
+
+def detect_separator_short_table(image: Image.Image, expected: float,
+                                 original: Separator
+                                 ) -> tuple[Separator, CutPath] | None:
+    """Fourth pass: rerun familiar detectors on the observed printed region.
+
+    It never alters results from passes 1-3. It also never accepts a separator
+    based only on where earlier pages were split. The cropped region must
+    independently demonstrate the fiscal-columns-to-wide-NOMS signature and
+    yield at least ten consistent traced printed-rule samples.
+    """
+    span = _short_table_active_region(image, expected)
+    if span is None:
+        return None
+    top, bottom = span
+    y0, y1 = round(image.height * top), round(image.height * bottom)
+    if y1-y0 < 150:
+        return None
+    region = image.crop((0, y0, image.width, y1))
+    candidate = detect_separator(region)
+    if not candidate.accepted:
+        local_tolerant = detect_separator_tolerant(region, expected)
+        if local_tolerant is not None:
+            candidate = local_tolerant
+    if (candidate.strength < .075 or
+            abs(candidate.fraction-expected) > .045 or
+            (original.strength >= .075 and
+             abs(candidate.fraction-original.fraction) > .035)):
+        return None
+    local_path = detect_cut_path(region, candidate)
+    reliable = ((candidate.accepted or
+                 (candidate.reason == "curved_or_inconsistent_border_needs_review"
+                  and local_path.kind != "vertical"))
+                and local_path.sample_count >= 10
+                and local_path.reason != "too_few_consistent_rule_samples")
+    if not reliable:
+        # The original extreme tracer is reused on the *short* image, where
+        # its full-height sampling now corresponds to the actual table area.
+        extreme = detect_separator_extreme(region, expected)
+        if extreme is None:
+            return None
+        candidate, local_path = extreme
+    # Convert a polynomial in cropped-region height to a polynomial in full
+    # image height, then clamp it to the observed table interval so it cannot
+    # bend unpredictably through the blank lower portion.
+    scale = bottom-top
+    u_to_local = np.poly1d([1./scale, -(top+bottom-1.)/scale])
+    full_coef = np.poly1d(local_path.coefficients)(u_to_local).c
+    if not np.all(np.isfinite(full_coef)):
+        return None
+    path = CutPath(local_path.kind, tuple(float(v) for v in full_coef),
+                   local_path.sample_count, local_path.residual_fraction,
+                   local_path.max_shift_fraction,
+                   "verified_short_table_rule_trace", (2*top-1, 2*bottom-1))
+    positions = path.fractions(image.height)
+    if (positions.min() <= .36 or positions.max() >= .64 or
+            np.max(np.abs(positions-expected)) > .09):
+        return None
+    midpoint = float(positions[len(positions)//2])
+    result = Separator(midpoint, candidate.strength, candidate.left_header_rules,
+                       candidate.right_header_rules, candidate.second_strength,
+                       min(.85, candidate.confidence), candidate.drift_fraction,
+                       True, "recovered_short_table_active_region")
+    return result, path
 
 
 def _fit_robust(ys: np.ndarray, xs: np.ndarray, degree: int
@@ -340,30 +866,34 @@ def crop_tables(image: Image.Image, fraction: float, overlap_fraction: float = .
 
 
 def _preview(image: Image.Image, result: Separator, title: str,
-             path: CutPath | None = None, approved: bool | None = None) -> Image.Image:
+             path: CutPath | None = None, approved: bool | None = None,
+             single_table: str | None = None) -> Image.Image:
     view = image.convert("RGB")
     view.thumbnail((1100, 1100), Image.Resampling.LANCZOS)
     draw = ImageDraw.Draw(view)
     if path is None:
         path = CutPath("vertical", (result.fraction,), 0, float('nan'), 0., "legacy")
-    frac = path.fractions(view.height)
-    points = [(round(view.width * float(frac[y])), y)
-              for y in range(31, view.height, 2)]
-    if len(points) >= 2:
-        draw.line(points, fill=(220, 0, 210), width=3)
-    if path.kind != "vertical":
+    if single_table is None:
+        frac = path.fractions(view.height)
+        points = [(round(view.width * float(frac[y])), y)
+                  for y in range(31, view.height, 2)]
+        if len(points) >= 2:
+            draw.line(points, fill=(220, 0, 210), width=3)
+    if single_table is None and path.kind != "vertical":
         x0 = round(view.width * result.fraction)
         for y in range(35, view.height, 18):
             draw.line([(x0, y), (x0, min(y+7, view.height-1))],
                       fill=(245, 140, 0), width=2)
-    for r in (.42, .58):
-        xx = round(view.width * r)
-        for y in range(31, view.height, 18):
-            draw.line([(xx, y), (xx, min(y + 8, view.height - 1))], fill=(50, 155, 230), width=2)
+    if single_table is None:
+        for r in (.42, .58):
+            xx = round(view.width * r)
+            for y in range(31, view.height, 18):
+                draw.line([(xx, y), (xx, min(y + 8, view.height - 1))], fill=(50, 155, 230), width=2)
     draw.rectangle((0, 0, view.width, 31), fill=(21, 45, 62))
     status = "ACCEPTED" if (result.accepted if approved is None else approved) else "REVIEW ONLY"
-    draw.text((8, 8), f"{title} | {status} | x={result.fraction:.2%} | "
-              f"{path.kind} | {result.reason}", fill="white")
+    label = (f"SINGLE TABLE {single_table} | no dividing line" if single_table
+             else f"x={result.fraction:.2%} | {path.kind} | {result.reason}")
+    draw.text((8, 8), f"{title} | {status} | {label}", fill="white")
     return view
 
 
@@ -385,7 +915,8 @@ def _contact_sheet(files: list[Path], target: Path) -> None:
 def split_year(*, year: int, pages: list[int] | None, dpi: int,
                input_root: Path = DEFAULT_INPUT, output_root: Path = DEFAULT_OUTPUT,
                overlap_fraction: float = .004, force_review: bool = False,
-               cut_mode: str = "auto") -> list[dict]:
+               cut_mode: str = "auto", extreme: bool = True,
+               short_table: bool = True) -> list[dict]:
     folder = input_root / str(year)
     if not folder.is_dir():
         raise FileNotFoundError(f"Missing first-stage outputs at {folder}; run code/split_spreads.py first")
@@ -397,18 +928,29 @@ def split_year(*, year: int, pages: list[int] | None, dpi: int,
                 if row.get("pdf_page") and row.get("status"):
                     prior_status[int(row["pdf_page"])] = row["status"]
     sources: list[tuple[int, str, Path]] = []
+    reference_sources: list[tuple[int, str, Path]] = []
     wanted = set(pages) if pages else None
     for source in sorted(folder.glob(f"p????_*_{dpi}dpi.png")):
         m = PATTERN.fullmatch(source.name)
         if m:
             page = int(m.group("page"))
+            stage_1_status = prior_status.get(page, "missing_from_manifest") if prior_manifest.exists() else "accepted"
+            if stage_1_status not in {"accepted", "accepted_single"} and not force_review:
+                if wanted is None or page in wanted:
+                    print(f"{year} PDF p.{page} {m.group('side')}: skip; stage 1 status={stage_1_status}")
+                continue
+            reference_sources.append((page, m.group("side"), source))
             if wanted is None or page in wanted:
-                if prior_status.get(page, "accepted") != "accepted" and not force_review:
-                    print(f"{year} PDF p.{page} {m.group('side')}: skip; stage 1 status={prior_status[page]}")
-                    continue
                 sources.append((page, m.group("side"), source))
     if not sources:
         raise FileNotFoundError(f"No first-stage PNGs in {folder} matching year={year}, pages={pages}, dpi={dpi}")
+    # Pass 1: gather original detections and learn only very stable per-year
+    # left/right (or odd/even) positions from confidently accepted pages.
+    initial: dict[Path, Separator] = {}
+    for _, _, source in reference_sources:
+        with Image.open(source) as image:
+            initial[source] = detect_separator(image)
+    priors = layout_priors(reference_sources, initial)
     out = output_root / str(year)
     preview_dir = out / "previews"
     preview_dir.mkdir(parents=True, exist_ok=True)
@@ -417,31 +959,109 @@ def split_year(*, year: int, pages: list[int] | None, dpi: int,
     for page, side, src in sources:
         with Image.open(src) as im:
             image = im.convert("L")
-        result = detect_separator(image)
+        original = initial[src]
+        expected = priors.get(layout_bucket(page, side))
+        result = original
+        # A genuinely empty parallel half takes precedence, even when the
+        # old header detector mistakes the last rule of the populated table
+        # for a central two-table boundary.
+        single_table = detect_single_table_side(image)
+        # Pass 2 is only attempted for original failures and must independently
+        # identify printed-rule evidence. A prior alone cannot create a cut.
+        if single_table is None and not original.accepted and expected is not None:
+            alternative = detect_separator_tolerant(image, expected)
+            if alternative is not None:
+                result = alternative
         path = detect_cut_path(image, result, mode=cut_mode)
+        # Pass 3: untouched by normal successes; expanded vertical, linear and
+        # quadratic hypotheses are attempted only after both earlier passes
+        # have failed. They always require visible rule evidence.
+        extreme_found = False
+        recovered_base = (not result.accepted and
+                          result.reason == "curved_or_inconsistent_border_needs_review"
+                          and path.kind != "vertical")
+        if (extreme and cut_mode == "auto" and single_table is None
+                and not result.accepted and not recovered_base and expected is not None):
+            candidate = detect_separator_extreme(image, expected)
+            if candidate is not None:
+                result, path = candidate
+                extreme_found = True
+        # Pass 4: only previously unresolved pages, and only when the scan
+        # visibly has two parallel printed tables ending in its upper portion.
+        # This does not change any pass 1-3 decisions or their crop geometry.
+        short_found = False
+        if (short_table and cut_mode == "auto" and single_table is None
+                and not result.accepted and not recovered_base
+                and not extreme_found and expected is not None):
+            short_candidate = detect_separator_short_table(image, expected, original)
+            if short_candidate is not None:
+                result, path = short_candidate
+                short_found = True
         # Only the specific old rejection for excessive border drift may be
         # recovered by a well-supported fit. Never override weak/ambiguous
         # table identification.
         recovered = (not result.accepted and
                      result.reason == "curved_or_inconsistent_border_needs_review" and
                      path.kind != "vertical")
-        safe = result.accepted or recovered
+        safe = result.accepted or recovered or single_table is not None
         stem = f"p{page:04d}_{side}"
-        view = _preview(image, result, f"{year} PDF p.{page} {side}",
-                        path, approved=safe)
+        label = (f"{year} PDF p.{page} {side} | SHORT TABLE PENDING REVIEW"
+                 if short_found else
+                 f"{year} PDF p.{page} {side} | EXTREME PENDING REVIEW"
+                 if extreme_found else f"{year} PDF p.{page} {side}")
+        view = _preview(image, result, label,
+                        path, approved=safe and not (extreme_found or short_found),
+                        single_table=single_table)
         view_path = preview_dir / f"{stem}_separator.jpg"
         view.save(view_path, quality=90)
         previews.append(view_path)
         first_path = second_path = ""
+        # Clean up candidate images from passes not selected this run. Never
+        # leave stale review-only crops that could be mistaken for new output.
+        for candidate_dir, selected in (("extreme_candidates", extreme_found),
+                                        ("short_table_candidates", short_found)):
+            if not selected:
+                for n in (1, 2):
+                    stale = out / candidate_dir / f"{stem}_col{n}_{dpi}dpi.png"
+                    if stale.exists():
+                        stale.unlink()
         status = "accepted" if safe else "needs_review"
-        if safe or force_review:
+        if single_table is not None:
+            # If only one parallel table is present, retain the *full* printed
+            # page as its one OCR image. No fabricated second-table crop.
+            table_index = 1 if single_table == "left" else 2
+            table_file = out / f"{stem}_col{table_index}_{dpi}dpi.png"
+            image.save(table_file)
+            if table_index == 1:
+                first_path = str(table_file)
+            else:
+                second_path = str(table_file)
+            absent_index = 3-table_index
+            stale = out / f"{stem}_col{absent_index}_{dpi}dpi.png"
+            if stale.exists():
+                stale.unlink()
+            status = "accepted_single_table"
+        elif safe or force_review:
             first, second, _ = crop_tables_along_path(image, path, overlap_fraction)
-            first_file = out / f"{stem}_col1_{dpi}dpi.png"
-            second_file = out / f"{stem}_col2_{dpi}dpi.png"
+            # Never include unverified extreme candidates in the ordinary
+            # production table-image folder. OCR should not consume these
+            # until a human approves their cut boundaries.
+            destination = (out / "short_table_candidates" if short_found else
+                           out / "extreme_candidates" if extreme_found else out)
+            destination.mkdir(parents=True, exist_ok=True)
+            first_file = destination / f"{stem}_col1_{dpi}dpi.png"
+            second_file = destination / f"{stem}_col2_{dpi}dpi.png"
             first.save(first_file)
             second.save(second_file)
             first_path, second_path = str(first_file), str(second_file)
-            if not safe:
+            if extreme_found or short_found:
+                status = ("accepted_short_table_pending_review" if short_found
+                          else "accepted_extreme_pending_review")
+                for n in (1, 2):
+                    old = out / f"{stem}_col{n}_{dpi}dpi.png"
+                    if old.exists():
+                        old.unlink()
+            elif not safe:
                 status = "provisional_review_only"
         else:
             # If a previous run accepted a page but a new run does not, remove
@@ -451,15 +1071,30 @@ def split_year(*, year: int, pages: list[int] | None, dpi: int,
                 if stale.exists():
                     stale.unlink()
         row = {"year": year, "pdf_page": page, "printed_side": side,
-               "status": status, "reason": ("recovered_curved_border" if recovered else result.reason),
-               "cut_method": path.kind, "cut_path_coefficients": ";".join(f"{v:.8g}" for v in path.coefficients),
+               "status": status,
+               "reason": ("single_printed_table_only" if single_table
+                          else "recovered_curved_border" if recovered else result.reason),
+               "table_count": 1 if single_table else (2 if (safe or force_review) else 0),
+               "single_table_side": single_table or "",
+               "expected_cut_fraction": (round(expected, 6) if expected is not None else ""),
+               "detection_pass": ("single_table" if single_table else
+                                  "short_table" if short_found else "extreme"
+                                  if extreme_found else
+                                  "tolerant" if result is not original else "strict"),
+               "cut_method": "none" if single_table else path.kind,
+               "cut_path_coefficients": ("" if single_table
+                                         else ";".join(f"{v:.8g}" for v in path.coefficients)),
                "cut_path_points": path.sample_count,
                "cut_path_residual_fraction": (round(path.residual_fraction, 6)
                                                if np.isfinite(path.residual_fraction) else ""),
                "cut_path_max_shift_fraction": round(path.max_shift_fraction, 6),
                "cut_path_reason": path.reason,
-               "cut_fraction": round(result.fraction, 6),
-               "cut_x_px": round(image.width * result.fraction),
+               "active_table_top_fraction": (round((path.active_y_range[0]+1)/2, 6)
+                                             if path.active_y_range else ""),
+               "active_table_bottom_fraction": (round((path.active_y_range[1]+1)/2, 6)
+                                                if path.active_y_range else ""),
+               "cut_fraction": "" if single_table else round(result.fraction, 6),
+               "cut_x_px": "" if single_table else round(image.width * result.fraction),
                "image_width_px": image.width,
                "vertical_strength": round(result.strength, 5),
                "header_rules_before": round(result.left_header_rules, 4),
@@ -471,23 +1106,40 @@ def split_year(*, year: int, pages: list[int] | None, dpi: int,
                "source_image": str(src), "table_1": first_path, "table_2": second_path,
                "preview": str(view_path), "algorithm": VERSION}
         rows.append(row)
-        print(f"{year} PDF p.{page} {side}: {status}, "+
-              (f"cut={100*result.fraction:.2f}%, method={path.kind}, line={result.strength:.3f}"
-               if result.strength else result.reason))
-    fields = ["year", "pdf_page", "printed_side", "status", "reason", "cut_method",
+        summary = (f"single table on {single_table}" if single_table else
+                   f"cut={100*result.fraction:.2f}%, method={path.kind}, "
+                   f"pass={row['detection_pass']}, line={result.strength:.3f}"
+                   if result.strength else result.reason)
+        print(f"{year} PDF p.{page} {side}: {status}, {summary}")
+    fields = ["year", "pdf_page", "printed_side", "status", "reason", "table_count",
+              "single_table_side", "expected_cut_fraction", "detection_pass", "cut_method",
               "cut_path_coefficients", "cut_path_points", "cut_path_residual_fraction",
-              "cut_path_max_shift_fraction", "cut_path_reason", "cut_fraction",
+              "cut_path_max_shift_fraction", "cut_path_reason",
+              "active_table_top_fraction", "active_table_bottom_fraction", "cut_fraction",
               "cut_x_px", "image_width_px", "vertical_strength", "header_rules_before",
               "header_rules_after", "second_candidate", "confidence_heuristic",
               "border_drift_fraction", "input_sha256",
               "source_image", "table_1", "table_2", "preview", "algorithm"]
     report = out / "table_split_review.csv"
+    if wanted is not None and report.exists():
+        # Rechecking a few pages should not erase already reviewed records
+        # for other pages. The aggregate retains all known pages as well.
+        seen = {(int(row["pdf_page"]), row["printed_side"]) for row in rows}
+        with report.open(newline="", encoding="utf-8") as old:
+            for previous in csv.DictReader(old):
+                key = (int(previous["pdf_page"]), previous["printed_side"])
+                if key not in seen and key[0] not in wanted:
+                    rows.append(previous)
+        rows.sort(key=lambda r: (int(r["pdf_page"]),
+                                 {"single":0,"left":1,"right":2}.get(r["printed_side"],9)))
     with report.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
     _contact_sheet(previews, out / "review_contact_sheet.jpg")
+    aggregate = aggregate_review_csvs(output_root)
     print(f"Review CSV: {report}")
+    print(f"All-years review CSV: {aggregate}")
     print(f"Contact sheet: {out / 'review_contact_sheet.jpg'}")
     print("No OCR was performed. Review the central separator before using these crops with Mistral.")
     return rows
@@ -495,7 +1147,9 @@ def split_year(*, year: int, pages: list[int] | None, dpi: int,
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--year", required=True, type=int)
+    parser.add_argument("--year", type=int)
+    parser.add_argument("--combine-only", action="store_true",
+                        help="Regenerate the all-years CSV from existing annual reports, without processing images")
     parser.add_argument("--pages", nargs="+", type=int, default=None,
                         help="PDF page numbers in the first-stage outputs; default all")
     parser.add_argument("--dpi", type=int, default=200,
@@ -506,15 +1160,25 @@ def main() -> None:
                         help="Shared border margin as fraction of printed-page width")
     parser.add_argument("--cut-mode", choices=["auto", "vertical"], default="auto",
                         help="auto fits well-supported slanted/curved boundaries; vertical restores v1 cropping")
+    parser.add_argument("--no-extreme", dest="extreme", action="store_false",
+                        help="Disable the review-only third pass; reproduce v1.3 decisions")
+    parser.add_argument("--no-short-table", dest="short_table", action="store_false",
+                        help="Disable fourth pass; reproduce v1.4 decisions")
     parser.add_argument("--force-review", action="store_true",
                         help="Write provisional images for uncertain cuts; never treat them as validated")
     args = parser.parse_args()
+    if args.combine_only:
+        print(f"All-years review CSV: {aggregate_review_csvs(args.output_root)}")
+        return
+    if args.year is None:
+        parser.error("--year is required unless --combine-only is selected")
     if args.dpi < 72 or args.dpi > 400:
         parser.error("--dpi must be between 72 and 400")
     split_year(year=args.year, pages=args.pages, dpi=args.dpi,
                input_root=args.input_root, output_root=args.output_root,
                overlap_fraction=args.overlap, force_review=args.force_review,
-               cut_mode=args.cut_mode)
+               cut_mode=args.cut_mode, extreme=args.extreme,
+               short_table=args.short_table)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Conservatively split two-page PDF scan spreads along their dark central gutter.
 
-This is a preprocessing experiment, separate from OCR and table layout detection.
-It never edits source PDFs, makes no API calls, and refuses uncertain splits unless
-explicitly asked to produce review-only half images.
+This stage preserves single-page scans intact and splits only configured
+two-page spreads. It never edits source PDFs or calls paid services. Uncertain
+gutter detection is flagged, and no such split is produced by default.
 
 Run from the repository root:
     .venv/bin/python code/split_spreads.py --year 1882 --pages 245 247 249
@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = ROOT / "schema" / "situation_financiere" / "page_ranges.json"
 DEFAULT_INPUT = ROOT / "raw_data" / "situation_financiere_communes"
 DEFAULT_OUTPUT = ROOT / "derived" / "situation_financiere" / "split_pages"
-VERSION = "center_gutter_trim_v1_1"
+VERSION = "configured_spread_or_single_v1_2"
 
 
 @dataclass(frozen=True)
@@ -180,6 +180,16 @@ def _preview(image: Image.Image, x: int, min_ratio: float, max_ratio: float,
     return visual
 
 
+def _single_preview(image: Image.Image, title: str) -> Image.Image:
+    """A visibly labelled passthrough preview (no split line)."""
+    view = image.convert("RGB")
+    view.thumbnail((1300, 1050), Image.Resampling.LANCZOS)
+    draw = ImageDraw.Draw(view)
+    draw.rectangle((0, 0, view.width, 30), fill=(24, 44, 55))
+    draw.text((8, 8), f"{title}: SINGLE PAGE (kept intact)", fill="white")
+    return view
+
+
 def _contact_sheet(paths: list[Path], dest: Path) -> None:
     if not paths:
         return
@@ -224,8 +234,8 @@ def process_year(*, year: int, requested_pages: list[int] | None, dpi: int,
         for pdf_page in pages:
             page = doc[pdf_page - 1]
             page_id = f"p{pdf_page:04d}"
-            # Do not accidentally bisect a single printed page. Aspect ratio
-            # classification is intentionally conservative and reviewable.
+            # The year configuration is authoritative; aspect ratio is used
+            # only for legacy/unconfigured projects with scan_layout="auto".
             layout_override = spec.get("scan_layout_overrides", {}).get(str(pdf_page),
                               spec.get("scan_layout", "auto"))
             if layout_override == "auto":
@@ -233,13 +243,38 @@ def process_year(*, year: int, requested_pages: list[int] | None, dpi: int,
             elif layout_override in {"spread", "single"}:
                 is_spread = layout_override == "spread"
             else:
-                raise ValueError(f"Invalid scan_layout {layout_override}")
-            if not is_spread:
-                print(f"{year} PDF p.{pdf_page}: skipping single-page scan")
-                rows.append({"year": year, "pdf_page": pdf_page,
-                             "status": "skipped_single_page", "reason": "single_page_scan"})
-                continue
+                raise ValueError(f"Invalid scan_layout {layout_override!r}")
+            page_sides = spec.get("page_sides", {})
+            if not isinstance(page_sides, dict):
+                raise ValueError("page_sides must be a mapping of PDF page to side list")
+            sides = page_sides.get(str(pdf_page), ["left", "right"])
+            if not isinstance(sides, list) or not sides or len(sides) != len(set(sides)) or any(
+                    side not in {"left", "right"} for side in sides):
+                raise ValueError(f"Invalid page_sides on PDF page {pdf_page}: {sides}")
+            if not is_spread and str(pdf_page) in page_sides:
+                raise ValueError(f"PDF page {pdf_page}: page_sides is only valid for spreads")
             image = _render_pdf_page(page, dpi)
+            # Remove prior outputs of another layout if a configuration changes.
+            stale_sides = ("left", "right") if not is_spread else ("single",)
+            for side in stale_sides:
+                stale = out / f"{page_id}_{side}_{dpi}dpi.png"
+                if stale.exists():
+                    stale.unlink()
+            if not is_spread:
+                dest = out / f"{page_id}_single_{dpi}dpi.png"
+                image.save(dest)
+                if make_pdfs:
+                    image.convert("RGB").save(dest.with_suffix(".pdf"), resolution=dpi)
+                preview_path = overlays_dir / f"{page_id}_single.jpg"
+                _single_preview(image, f"{year} PDF p.{pdf_page}").save(preview_path, quality=90)
+                previews.append(preview_path)
+                rows.append({"year": year, "pdf_page": pdf_page,
+                             "scan_layout": "single", "status": "accepted_single",
+                             "reason": "configured_single_page_pass_through",
+                             "width_px": image.width, "single_image": str(dest),
+                             "preview": str(preview_path), "algorithm": VERSION})
+                print(f"{year} PDF p.{pdf_page}: accepted_single (no page split)")
+                continue
             result = detect_gutter(image, center_min=center_min, center_max=center_max)
             x = round(result.x_ratio * image.width)
             preview_path = overlays_dir / f"{page_id}_cut.jpg"
@@ -254,9 +289,6 @@ def process_year(*, year: int, requested_pages: list[int] | None, dpi: int,
                                             inner_trim_fraction=inner_trim_fraction)
                 # Boundary scans may contain a page from the neighbouring
                 # department: follow existing page_sides config when available.
-                sides = spec.get("page_sides", {}).get(str(pdf_page), ["left", "right"])
-                if not isinstance(sides, list) or any(s not in {"left", "right"} for s in sides):
-                    raise ValueError(f"Invalid page_sides on PDF page {pdf_page}: {sides}")
                 if "left" in sides:
                     dest = out / f"{page_id}_left_{dpi}dpi.png"
                     left.save(dest)
@@ -284,7 +316,7 @@ def process_year(*, year: int, requested_pages: list[int] | None, dpi: int,
                     stale = out / f"{page_id}_{side}_{dpi}dpi.png"
                     if stale.exists():
                         stale.unlink()
-            row = {"year": year, "pdf_page": pdf_page, "status": status,
+            row = {"year": year, "pdf_page": pdf_page, "scan_layout": "spread", "status": status,
                    "reason": result.reason, "split_fraction": round(result.x_ratio, 6),
                    "split_x_px": x, "width_px": image.width,
                    "inner_trim_fraction": inner_trim_fraction,
@@ -299,10 +331,10 @@ def process_year(*, year: int, requested_pages: list[int] | None, dpi: int,
             rows.append(row)
             print(f"{year} PDF p.{pdf_page}: {status}, cut={100*result.x_ratio:.2f}%, "
                   f"prominence={result.prominence:.3f}")
-    fields = ["year", "pdf_page", "status", "reason", "split_fraction", "split_x_px",
+    fields = ["year", "pdf_page", "scan_layout", "status", "reason", "split_fraction", "split_x_px",
               "width_px", "inner_trim_fraction", "overlap_fraction", "left_end_px",
               "right_start_px", "darkness_score", "background_score", "prominence",
-              "left_image", "right_image", "preview", "algorithm"]
+              "left_image", "right_image", "single_image", "preview", "algorithm"]
     with (out / "split_review.csv").open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
@@ -310,7 +342,7 @@ def process_year(*, year: int, requested_pages: list[int] | None, dpi: int,
     _contact_sheet(previews, out / "review_contact_sheet.jpg")
     print(f"Review CSV: {out / 'split_review.csv'}")
     print(f"Contact sheet: {out / 'review_contact_sheet.jpg'}")
-    print("No OCR was performed. Check previews before processing the half-page images.")
+    print("No OCR was performed. Check the preserved single pages and accepted spread crops.")
     return rows
 
 

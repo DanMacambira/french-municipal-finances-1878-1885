@@ -107,3 +107,148 @@ If the original detector said only that the rule drift was too large, a highly
 consistent fitted path may recover it. Unidentified/competing separators remain
 `needs_review`, regardless of polynomial fit. Review crops visually before OCR:
 none of these confidence checks guarantees that text is uncut.
+
+The input glob accepts `pXXXX_single_<dpi>dpi.png` alongside spread half-images.
+Both formats use the same independent two-table separator detector.
+
+## Version 1.3: conservative second pass and consolidated review
+
+The existing strict divider detector remains **first**. When it cannot locate the
+separator, the script learns a **position prior** from successful pages in the
+same annual volume and orientation: the printed `left` or `right` spread side,
+or the PDF-page parity for scanned single pages. This prior merely restricts
+where a *new image-based search* takes place. It does not itself justify a
+crop. The second search looks for a nearby printed vertical rule and the
+transition from multiple narrow fiscal columns to the wide `NOMS` column,
+using a shorter line detector and several vertical bands (including lower
+headers on introductory pages). Weak, conflicting or unconfirmed evidence
+remains `needs_review`. An originally accepted cut is never replaced by the
+second detector. The existing slanted/quadratic fit and vertical fallback
+remain unchanged.
+
+When one parallel half is **demonstrably almost blank** and the other contains
+printed long rules and ink, the script may set `accepted_single_table` and
+save only the existing table (as `col1` or `col2`). It saves the full printed
+page image for that table instead of trimming at an unsupported boundary.
+This safeguard does **not** infer a single table merely because the ordinary
+separator detector fails; ambiguous pages remain `needs_review`.
+
+The report adds `detection_pass` (`strict`, `tolerant`, `single_table`),
+`expected_cut_fraction`, `table_count`, and `single_table_side`. In particular,
+a provisional 50% `cut_fraction` in a `needs_review` row is **not** a verified
+cut. `accepted` is still a detector decision, not manual ground truth.
+
+Every yearly run also refreshes:
+
+`derived/situation_financiere/table_panels/all_years_table_split_review.csv`
+
+This CSV is simply all available annual `table_split_review.csv` rows together,
+sorted by year, PDF page and printed side. It includes rejected pages. To
+rebuild this file from existing annual CSVs *without rerunning any images*:
+
+```bash
+.venv/bin/python code/split_tables.py --combine-only
+```
+
+Rerunning a subset with `--pages` preserves previous CSV rows for pages not
+selected. The contact sheet from that subset shows only pages processed in
+that run; run the full year again for a complete year contact sheet. To update
+all years and rebuild the aggregate:
+
+```bash
+for year in 1878 1879 1880 1881 1882 1883 1884 1885; do
+  .venv/bin/python code/split_tables.py --year "$year"
+done
+.venv/bin/python code/split_tables.py --combine-only
+```
+
+**No Mistral calls are made.** Check actual full-size crops for any newly
+recovered pages before feeding them to OCR. Some genuinely exceptional or
+occluded pages should remain flagged; do not force them into two outputs.
+
+
+## Version 1.4: extreme third pass (pending visual approval)
+
+If both the original detector and the tolerant second pass fail, **and** a
+stable same-year/same-orientation prior exists, an optional third pass can
+trace the double rule through 17 short horizontal bands. This permits the
+rule to move considerably from left to right with height. It compares
+**vertical, linear, and quadratic** fits, with wider thresholds than stages
+1-2; it still needs (a) local printed-rule pixels over most of the page,
+(b) at least two upper-page indications of narrow fiscal columns followed by
+the wide `NOMS` column, and (c) a stable fit that does not match a competing
+central rule. An estimated position by itself **never** authorizes a cut.
+The previous decisions of already-accepted pages are not recomputed or
+modified by the extended pass.
+
+A recovered page receives:
+
+- `status=accepted_extreme_pending_review`
+- `detection_pass=extreme`
+- `cut_method=vertical`, `linear` or `quadratic`
+
+This is **not OCR approval**. Its two unverified images are saved under
+`derived/situation_financiere/table_panels/{year}/extreme_candidates/`, outside
+the ordinary production crop directory. The contact-sheet preview is tagged
+`EXTREME PENDING REVIEW` and the annual/combined CSVs give their paths.
+If the extreme fit is unsupported or ambiguous, the page stays `needs_review`.
+The detector does not force an invented second table on a one-table page.
+
+Try the six previously unresolved cases without overwriting other annual CSV
+rows (run Stage 1 first, if needed):
+
+```bash
+.venv/bin/python code/split_tables.py --year 1881 --pages 466
+.venv/bin/python code/split_tables.py --year 1883 --pages 495 497 499 502
+.venv/bin/python code/split_tables.py --year 1884 --pages 501
+.venv/bin/python code/split_tables.py --combine-only
+```
+
+Inspect each contact-sheet preview and **full-resolution image in
+`extreme_candidates/`** before deciding it can be used for Mistral.
+To return to the v1.3 detection behavior, use `--no-extreme`. To disable all
+curve fitting as well, use `--cut-mode vertical` (which also disables the
+extreme fit). Re-running a page with `--no-extreme` clears stale experimental
+candidate crops for that page. No Mistral, PDFs, or schema settings are
+modified by this patch.
+
+## Version 1.5: fourth pass for tables ending above the page bottom
+
+The first three detectors are **unchanged**. Only a page that is still
+`needs_review` may enter the short-table fallback. The fallback must:
+
+1. Find long printed column-rule activity on **both** sides of the expected
+   separator, excluding dark page margins. Both sides must begin near the top
+   and end together well above the physical page bottom.
+2. Crop **in memory** to that observed table height and retry the existing
+   strict/tolerant vertical, linear and quadratic algorithms. A positional
+   prior alone cannot authorize an output.
+3. Require at least ten coherent separator samples in this printed region.
+   Extend the selected boundary constantly through the blank remainder,
+   instead of extrapolating an unsupported slope or quadratic.
+
+Recovered pages receive `status=accepted_short_table_pending_review` and
+`detection_pass=short_table`. Their two crops are saved under
+`table_panels/{year}/short_table_candidates/` instead of the ordinary
+production output directory. They require a visual check **before OCR**.
+The annual and all-years CSVs also record `active_table_top_fraction` and
+`active_table_bottom_fraction` for these pages. All other rows leave those
+fields empty.
+
+To test the two known remaining cases (without rerunning Stage 1):
+
+```bash
+.venv/bin/python code/split_tables.py --year 1881 --pages 466
+.venv/bin/python code/split_tables.py --year 1883 --pages 502
+.venv/bin/python code/split_tables.py --combine-only
+```
+
+If a short table is not independently supported by printed rules, it remains
+`needs_review`. Use `--no-short-table` to reproduce the v1.4 decisions for a
+selected page (and remove stale short-table candidate crops). Previously
+accepted standard and extreme results are left untouched. `--cut-mode vertical`
+also disables this fourth-pass experiment.
+
+No OCR or schema changes occur in this release. The algorithm has synthetic
+regression tests, but the **original full-resolution scans of these two pages
+still need human visual verification**.

@@ -90,3 +90,8 @@ and a positive trim cannot be combined.
 Previously accepted PNGs are regenerated in place. If a scan is now flagged for
 review, stale crops are removed; a configured absent printed side is likewise
 removed so it cannot accidentally be passed to OCR.
+
+For years marked `scan_layout: single`, the script saves an intact
+`pXXXX_single_<dpi>dpi.png` and includes it in the contact sheet. A single-page
+scan is never bisected. For configured spreads, `page_sides` controls which
+printed halves are relevant. The year-wide review remains in `derived/`.
