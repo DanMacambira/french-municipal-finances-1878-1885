@@ -53,10 +53,10 @@ Run the included tests (without doing any OCR):
 
 ## Output paths
 
-- `derived/situation_financiere/table_panels/1882/p0245_left_col1_200dpi.png`
-- `derived/situation_financiere/table_panels/1882/p0245_left_col2_200dpi.png`
-- `derived/situation_financiere/table_panels/1882/p0245_right_col1_200dpi.png`
-- `derived/situation_financiere/table_panels/1882/p0245_right_col2_200dpi.png`
+- `derived/situation_financiere/table_panels/1882/accepted/p0245_left_col1_200dpi.png`
+- `derived/situation_financiere/table_panels/1882/accepted/p0245_left_col2_200dpi.png`
+- `derived/situation_financiere/table_panels/1882/accepted/p0245_right_col1_200dpi.png`
+- `derived/situation_financiere/table_panels/1882/accepted/p0245_right_col2_200dpi.png`
 - `derived/situation_financiere/table_panels/1882/previews/` (magenta cut lines)
 - `derived/situation_financiere/table_panels/1882/review_contact_sheet.jpg`
 - `derived/situation_financiere/table_panels/1882/table_split_review.csv`
@@ -188,7 +188,7 @@ A recovered page receives:
 - `cut_method=vertical`, `linear` or `quadratic`
 
 This is **not OCR approval**. Its two unverified images are saved under
-`derived/situation_financiere/table_panels/{year}/extreme_candidates/`, outside
+`derived/situation_financiere/table_panels/{year}/needs_review/`, outside
 the ordinary production crop directory. The contact-sheet preview is tagged
 `EXTREME PENDING REVIEW` and the annual/combined CSVs give their paths.
 If the extreme fit is unsupported or ambiguous, the page stays `needs_review`.
@@ -205,7 +205,7 @@ rows (run Stage 1 first, if needed):
 ```
 
 Inspect each contact-sheet preview and **full-resolution image in
-`extreme_candidates/`** before deciding it can be used for Mistral.
+`needs_review/`** before deciding it can be used for Mistral.
 To return to the v1.3 detection behavior, use `--no-extreme`. To disable all
 curve fitting as well, use `--cut-mode vertical` (which also disables the
 extreme fit). Re-running a page with `--no-extreme` clears stale experimental
@@ -229,7 +229,7 @@ The first three detectors are **unchanged**. Only a page that is still
 
 Recovered pages receive `status=accepted_short_table_pending_review` and
 `detection_pass=short_table`. Their two crops are saved under
-`table_panels/{year}/short_table_candidates/` instead of the ordinary
+`table_panels/{year}/needs_review/` instead of the ordinary
 production output directory. They require a visual check **before OCR**.
 The annual and all-years CSVs also record `active_table_top_fraction` and
 `active_table_bottom_fraction` for these pages. All other rows leave those
@@ -252,3 +252,33 @@ also disables this fourth-pass experiment.
 No OCR or schema changes occur in this release. The algorithm has synthetic
 regression tests, but the **original full-resolution scans of these two pages
 still need human visual verification**.
+
+
+## v1.6: parallel runs, visual review queues and statistics
+
+`--workers N` parallelizes the unchanged separator detectors across source
+pages (default up to four worker processes). The initial strict detections
+are evaluated across the whole year first so that the tolerant detector's
+layout priors remain identical to a serial run. Each worker limits OpenCV
+internal threads to one. This keeps outputs reproducible and avoids oversubscribing
+CPU resources. On memory-constrained Macs, use `--workers 1`.
+
+Directory layout for each year:
+
+- `table_panels/{year}/accepted/`: automatically accepted table crops **only**.
+- `table_panels/{year}/needs_review/`: full original printed-page PNGs for
+  unresolved cases, plus separately held provisional/extreme/short-table crops,
+  and their own individual previews and `review_contact_sheet.jpg`.
+- `table_panels/{year}/previews/`: diagnostic overlays for accepted cuts.
+- `table_panels/{year}/review_contact_sheet.jpg`: visual overview, paginated
+  after 48 items (`review_contact_sheet_002.jpg`, etc.).
+- `table_panels/{year}/table_split_review.csv` and
+  `table_panels/all_years_table_split_review.csv`: unchanged audit reports.
+
+A page marked `accepted_extreme_pending_review` or
+`accepted_short_table_pending_review` is **not** treated as OCR-ready. Its crop
+is placed in `needs_review/` until a separate manual approval process is
+implemented. `--pages` reruns preserve unaffected review CSV rows. The terminal
+shows only progress bars/timers and an end-of-run table with status, cut method
+(vertical/linear/quadratic) and detection pass (strict/tolerant/extreme/short).
+The scan detection and path-fitting thresholds are unchanged from v1.5.

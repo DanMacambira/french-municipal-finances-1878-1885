@@ -11,6 +11,9 @@ Run from the repository root:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import multiprocessing
+import os
 import csv
 import json
 import re
@@ -20,12 +23,15 @@ from pathlib import Path
 import numpy as np
 import pymupdf
 from PIL import Image, ImageDraw, ImageFont
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from segmentation_runtime import Progress, contact_sheets, summary_spreads
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = ROOT / "schema" / "situation_financiere" / "page_ranges.json"
 DEFAULT_INPUT = ROOT / "raw_data" / "situation_financiere_communes"
 DEFAULT_OUTPUT = ROOT / "derived" / "situation_financiere" / "split_pages"
-VERSION = "configured_spread_or_single_v1_2"
+VERSION = "multiprocess_stage1_v1_6"
 
 
 @dataclass(frozen=True)
@@ -207,148 +213,193 @@ def _contact_sheet(paths: list[Path], dest: Path) -> None:
     canvas.save(dest, quality=85)
 
 
+_PDF_WORKER_DOC = None
+
+
+def _init_pdf_worker(pdf_path: str) -> None:
+    """Each process owns its own PyMuPDF document; never share a document across workers."""
+    global _PDF_WORKER_DOC
+    _PDF_WORKER_DOC = pymupdf.open(pdf_path)
+
+
+def _run_spread_page_task(task: tuple) -> dict:
+    (year, pdf_page, dpi, spec, out, center_min, center_max,
+     overlap_fraction, make_pdfs, force_review, inner_trim_fraction) = task
+    if _PDF_WORKER_DOC is None:
+        raise RuntimeError('PDF worker has not been initialized')
+    page_id = f'p{pdf_page:04d}'
+    accepted_dir, review_dir = out / 'accepted', out / 'needs_review'
+    preview_dir = out / 'previews'
+    for directory in (accepted_dir, review_dir, preview_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    # Remove the processed page's old outputs, including v1.5 root-level
+    # images. A later failed detection must never leave a stale OCR-ready PNG.
+    for folder in (out, accepted_dir, review_dir):
+        for old in folder.glob(f'{page_id}_*'):
+            if old.is_file() and old.suffix.lower() in {'.png', '.pdf', '.jpg'}:
+                old.unlink()
+    for old in preview_dir.glob(f'{page_id}_*.jpg'):
+        old.unlink()
+    layout = spec.get('scan_layout_overrides', {}).get(str(pdf_page),
+                   spec.get('scan_layout', 'auto'))
+    pg = _PDF_WORKER_DOC[pdf_page - 1]
+    if layout == 'auto':
+        is_spread = pg.rect.width > pg.rect.height * 1.05
+    elif layout in {'spread', 'single'}:
+        is_spread = layout == 'spread'
+    else:
+        raise ValueError(f'Invalid scan_layout {layout!r}')
+    page_sides = spec.get('page_sides', {})
+    if not isinstance(page_sides, dict):
+        raise ValueError('page_sides must be a mapping')
+    sides = page_sides.get(str(pdf_page), ['left', 'right'])
+    if (not isinstance(sides, list) or not sides or len(sides) != len(set(sides))
+            or any(side not in {'left', 'right'} for side in sides)):
+        raise ValueError(f'Invalid page_sides at {pdf_page}: {sides}')
+    if not is_spread and str(pdf_page) in page_sides:
+        raise ValueError(f'page_sides is only valid for spreads: {pdf_page}')
+    image = _render_pdf_page(pg, dpi)
+    if not is_spread:
+        dest = accepted_dir / f'{page_id}_single_{dpi}dpi.png'
+        image.save(dest)
+        if make_pdfs:
+            image.convert('RGB').save(dest.with_suffix('.pdf'), resolution=dpi)
+        preview = preview_dir / f'{page_id}_single.jpg'
+        _single_preview(image, f'{year} PDF p.{pdf_page}').save(preview, quality=90)
+        return {'year': year, 'pdf_page': pdf_page, 'scan_layout': 'single',
+                'status': 'accepted_single', 'reason': 'configured_single_page_pass_through',
+                'width_px': image.width, 'single_image': str(dest),
+                'preview': str(preview), 'algorithm': VERSION}
+    result = detect_gutter(image, center_min=center_min, center_max=center_max)
+    x = round(result.x_ratio * image.width)
+    good = result.accepted
+    preview = ((preview_dir if good else review_dir) / f'{page_id}_cut.jpg')
+    _preview(image, x, center_min, center_max, result, f'{year} PDF p.{pdf_page}',
+             inner_trim_fraction=inner_trim_fraction).save(preview, quality=90)
+    left_path = right_path = ''
+    status = 'accepted' if good else 'needs_review'
+    if good or force_review:
+        left, right, _ = split_image(image, result.x_ratio, overlap_fraction,
+                                    inner_trim_fraction=inner_trim_fraction)
+        destination = accepted_dir if good else review_dir
+        if 'left' in sides:
+            target = destination / f'{page_id}_left_{dpi}dpi.png'
+            left.save(target)
+            left_path = str(target)
+            if make_pdfs and good:
+                left.convert('RGB').save(target.with_suffix('.pdf'), resolution=dpi)
+        if 'right' in sides:
+            target = destination / f'{page_id}_right_{dpi}dpi.png'
+            right.save(target)
+            right_path = str(target)
+            if make_pdfs and good:
+                right.convert('RGB').save(target.with_suffix('.pdf'), resolution=dpi)
+        if not good:
+            status = 'provisional_review_only'
+    if not good:
+        # Full original scan always available for inspecting a failed gutter.
+        image.save(review_dir / f'{page_id}_source_{dpi}dpi.png')
+    return {'year': year, 'pdf_page': pdf_page, 'scan_layout': 'spread',
+            'status': status, 'reason': result.reason,
+            'split_fraction': round(result.x_ratio, 6), 'split_x_px': x,
+            'width_px': image.width, 'inner_trim_fraction': inner_trim_fraction,
+            'overlap_fraction': overlap_fraction,
+            'left_end_px': x + round(image.width * overlap_fraction)
+                           - round(image.width * inner_trim_fraction),
+            'right_start_px': x - round(image.width * overlap_fraction)
+                              + round(image.width * inner_trim_fraction),
+            'darkness_score': round(result.peak_darkness, 4),
+            'background_score': round(result.background_darkness, 4),
+            'prominence': round(result.prominence, 4),
+            'left_image': left_path, 'right_image': right_path,
+            'preview': str(preview), 'algorithm': VERSION}
+
+
 def process_year(*, year: int, requested_pages: list[int] | None, dpi: int,
                  config: Path, input_dir: Path, output_dir: Path, center_min: float,
                  center_max: float, overlap_fraction: float, make_pdfs: bool,
-                 force_review: bool, inner_trim_fraction: float = .001) -> list[dict[str, str | int | float]]:
+                 force_review: bool, inner_trim_fraction: float = .001,
+                 workers: int = 1) -> list[dict[str, str | int | float]]:
     if overlap_fraction and inner_trim_fraction:
-        raise ValueError("overlap and inner trim cannot both be nonzero")
-    settings = json.loads(config.read_text(encoding="utf-8"))
+        raise ValueError('overlap and inner trim cannot both be nonzero')
+    if workers < 1:
+        raise ValueError('workers must be >= 1')
+    settings = json.loads(config.read_text(encoding='utf-8'))
     spec = settings.get(str(year), {})
-    if not spec.get("confirmed"):
-        raise ValueError(f"{year}: no confirmed page range in {config}")
-    filename = spec.get("pdf")
-    pdf_file = _find_pdf(input_dir, year, filename)
+    if not spec.get('confirmed'):
+        raise ValueError(f'{year}: no confirmed page range in {config}')
+    pdf_file = _find_pdf(input_dir, year, spec.get('pdf'))
     out = output_dir / str(year)
-    overlays_dir = out / "previews"
-    overlays_dir.mkdir(parents=True, exist_ok=True)
-    rows: list[dict[str, str | int | float]] = []
-    previews: list[Path] = []
+    out.mkdir(parents=True, exist_ok=True)
     with pymupdf.open(pdf_file) as doc:
-        start, end = int(spec["start"]), int(spec["end"])
+        start, end = int(spec['start']), int(spec['end'])
         if not 1 <= start <= end <= len(doc):
-            raise ValueError(f"Invalid page range: {start}..{end}, PDF has {len(doc)} pages")
-        pages = sorted(set(requested_pages)) if requested_pages else list(range(start, end + 1))
-        if any(p < start or p > end for p in pages):
-            raise ValueError(f"Requested PDF pages must be inside confirmed range {start}-{end}")
-        for pdf_page in pages:
-            page = doc[pdf_page - 1]
-            page_id = f"p{pdf_page:04d}"
-            # The year configuration is authoritative; aspect ratio is used
-            # only for legacy/unconfigured projects with scan_layout="auto".
-            layout_override = spec.get("scan_layout_overrides", {}).get(str(pdf_page),
-                              spec.get("scan_layout", "auto"))
-            if layout_override == "auto":
-                is_spread = page.rect.width > page.rect.height * 1.05
-            elif layout_override in {"spread", "single"}:
-                is_spread = layout_override == "spread"
-            else:
-                raise ValueError(f"Invalid scan_layout {layout_override!r}")
-            page_sides = spec.get("page_sides", {})
-            if not isinstance(page_sides, dict):
-                raise ValueError("page_sides must be a mapping of PDF page to side list")
-            sides = page_sides.get(str(pdf_page), ["left", "right"])
-            if not isinstance(sides, list) or not sides or len(sides) != len(set(sides)) or any(
-                    side not in {"left", "right"} for side in sides):
-                raise ValueError(f"Invalid page_sides on PDF page {pdf_page}: {sides}")
-            if not is_spread and str(pdf_page) in page_sides:
-                raise ValueError(f"PDF page {pdf_page}: page_sides is only valid for spreads")
-            image = _render_pdf_page(page, dpi)
-            # Remove prior outputs of another layout if a configuration changes.
-            stale_sides = ("left", "right") if not is_spread else ("single",)
-            for side in stale_sides:
-                stale = out / f"{page_id}_{side}_{dpi}dpi.png"
-                if stale.exists():
-                    stale.unlink()
-            if not is_spread:
-                dest = out / f"{page_id}_single_{dpi}dpi.png"
-                image.save(dest)
-                if make_pdfs:
-                    image.convert("RGB").save(dest.with_suffix(".pdf"), resolution=dpi)
-                preview_path = overlays_dir / f"{page_id}_single.jpg"
-                _single_preview(image, f"{year} PDF p.{pdf_page}").save(preview_path, quality=90)
-                previews.append(preview_path)
-                rows.append({"year": year, "pdf_page": pdf_page,
-                             "scan_layout": "single", "status": "accepted_single",
-                             "reason": "configured_single_page_pass_through",
-                             "width_px": image.width, "single_image": str(dest),
-                             "preview": str(preview_path), "algorithm": VERSION})
-                print(f"{year} PDF p.{pdf_page}: accepted_single (no page split)")
-                continue
-            result = detect_gutter(image, center_min=center_min, center_max=center_max)
-            x = round(result.x_ratio * image.width)
-            preview_path = overlays_dir / f"{page_id}_cut.jpg"
-            _preview(image, x, center_min, center_max, result, f"{year} PDF p.{pdf_page}",
-                     inner_trim_fraction=inner_trim_fraction).save(preview_path, quality=90)
-            previews.append(preview_path)
-            approved = result.accepted
-            status = "accepted" if approved else "needs_review"
-            left_path = right_path = ""
-            if approved or force_review:
-                left, right, _ = split_image(image, result.x_ratio, overlap_fraction,
-                                            inner_trim_fraction=inner_trim_fraction)
-                # Boundary scans may contain a page from the neighbouring
-                # department: follow existing page_sides config when available.
-                if "left" in sides:
-                    dest = out / f"{page_id}_left_{dpi}dpi.png"
-                    left.save(dest)
-                    left_path = str(dest)
-                    if make_pdfs:
-                        left.convert("RGB").save(dest.with_suffix(".pdf"), resolution=dpi)
-                if "right" in sides:
-                    dest = out / f"{page_id}_right_{dpi}dpi.png"
-                    right.save(dest)
-                    right_path = str(dest)
-                    if make_pdfs:
-                        right.convert("RGB").save(dest.with_suffix(".pdf"), resolution=dpi)
-                if not approved:
-                    status = "provisional_review_only"
-                # A boundary PDF scan may contain only one relevant printed
-                # page. Never leave a stale PNG for the excluded side.
-                for excluded in ({"left", "right"} - set(sides)):
-                    stale = out / f"{page_id}_{excluded}_{dpi}dpi.png"
-                    if stale.exists():
-                        stale.unlink()
-            else:
-                # Do not let a previously accepted crop remain available to
-                # downstream OCR after a later run flags the gutter.
-                for side in ("left", "right"):
-                    stale = out / f"{page_id}_{side}_{dpi}dpi.png"
-                    if stale.exists():
-                        stale.unlink()
-            row = {"year": year, "pdf_page": pdf_page, "scan_layout": "spread", "status": status,
-                   "reason": result.reason, "split_fraction": round(result.x_ratio, 6),
-                   "split_x_px": x, "width_px": image.width,
-                   "inner_trim_fraction": inner_trim_fraction,
-                   "overlap_fraction": overlap_fraction,
-                   "left_end_px": x + round(image.width * overlap_fraction) - round(image.width * inner_trim_fraction),
-                   "right_start_px": x - round(image.width * overlap_fraction) + round(image.width * inner_trim_fraction),
-                   "darkness_score": round(result.peak_darkness, 4),
-                   "background_score": round(result.background_darkness, 4),
-                   "prominence": round(result.prominence, 4),
-                   "left_image": left_path, "right_image": right_path,
-                   "preview": str(preview_path), "algorithm": VERSION}
-            rows.append(row)
-            print(f"{year} PDF p.{pdf_page}: {status}, cut={100*result.x_ratio:.2f}%, "
-                  f"prominence={result.prominence:.3f}")
-    fields = ["year", "pdf_page", "scan_layout", "status", "reason", "split_fraction", "split_x_px",
-              "width_px", "inner_trim_fraction", "overlap_fraction", "left_end_px",
-              "right_start_px", "darkness_score", "background_score", "prominence",
-              "left_image", "right_image", "single_image", "preview", "algorithm"]
-    with (out / "split_review.csv").open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
+            raise ValueError(f'Invalid page range: {start}..{end}, PDF has {len(doc)} pages')
+    page_ids = (sorted(set(requested_pages)) if requested_pages
+                else list(range(start, end + 1)))
+    if any(p < start or p > end for p in page_ids):
+        raise ValueError(f'Requested pages must be inside confirmed range {start}-{end}')
+    tasks = [(year, p, dpi, spec, out, center_min, center_max, overlap_fraction,
+              make_pdfs, force_review, inner_trim_fraction) for p in page_ids]
+    rows: list[dict] = []
+    progress = Progress(f'{year} | Stage 1', len(tasks))
+    if workers == 1:
+        _init_pdf_worker(str(pdf_file))
+        try:
+            for task in tasks:
+                rows.append(_run_spread_page_task(task))
+                progress.update()
+        finally:
+            global _PDF_WORKER_DOC
+            if _PDF_WORKER_DOC is not None:
+                _PDF_WORKER_DOC.close()
+                _PDF_WORKER_DOC = None
+    else:
+        ctx = multiprocessing.get_context('spawn')
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers,
+                  mp_context=ctx, initializer=_init_pdf_worker,
+                  initargs=(str(pdf_file),)) as pool:
+            futures = [pool.submit(_run_spread_page_task, task) for task in tasks]
+            for future in concurrent.futures.as_completed(futures):
+                rows.append(future.result())
+                progress.update()
+    fields = ['year', 'pdf_page', 'scan_layout', 'status', 'reason',
+              'split_fraction', 'split_x_px', 'width_px', 'inner_trim_fraction',
+              'overlap_fraction', 'left_end_px', 'right_start_px',
+              'darkness_score', 'background_score', 'prominence', 'left_image',
+              'right_image', 'single_image', 'preview', 'algorithm']
+    report = out / 'split_review.csv'
+    if requested_pages is not None and report.is_file():
+        current = {int(r['pdf_page']) for r in rows}
+        with report.open(newline='', encoding='utf-8') as handle:
+            for previous in csv.DictReader(handle):
+                if int(previous['pdf_page']) not in current:
+                    rows.append(previous)
+    rows.sort(key=lambda r: int(r['pdf_page']))
+    with report.open('w', encoding='utf-8', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction='ignore')
         writer.writeheader()
         writer.writerows(rows)
-    _contact_sheet(previews, out / "review_contact_sheet.jpg")
-    print(f"Review CSV: {out / 'split_review.csv'}")
-    print(f"Contact sheet: {out / 'review_contact_sheet.jpg'}")
-    print("No OCR was performed. Check the preserved single pages and accepted spread crops.")
+    all_previews = [Path(r['preview']) for r in rows if r.get('preview')]
+    review_previews = [Path(r['preview']) for r in rows
+                       if r.get('status') not in {'accepted', 'accepted_single'} and r.get('preview')]
+    contact_sheets(all_previews, out, name='review_contact_sheet', tile=(480,390))
+    contact_sheets(review_previews, out / 'needs_review',
+                   name='review_contact_sheet', tile=(480,390))
+    summary_spreads(rows, progress.elapsed)
+    print(f'Review CSV: {report}')
+    print(f'Accepted PNGs: {out / "accepted"}')
+    print(f'Needs-review PNGs/previews: {out / "needs_review"}')
+    print('No OCR was performed.')
     return rows
+
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--year", type=int, required=True, help="e.g., 1882")
+    parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1),
+                        help="parallel worker processes (default: up to 4, use 1 for serial)")
     parser.add_argument("--pages", nargs="+", type=int, help="1-based PDF page numbers; default: all confirmed pages")
     parser.add_argument("--dpi", type=int, default=200)
     parser.add_argument("--center-min", type=float, default=.45)
@@ -371,7 +422,8 @@ def main() -> None:
                  config=args.config, input_dir=args.input_dir, output_dir=args.output_dir,
                  center_min=args.center_min, center_max=args.center_max,
                  overlap_fraction=args.overlap, make_pdfs=args.pdf,
-                 force_review=args.force_review, inner_trim_fraction=args.inner_trim)
+                 force_review=args.force_review, inner_trim_fraction=args.inner_trim,
+                 workers=args.workers)
 
 
 if __name__ == "__main__":

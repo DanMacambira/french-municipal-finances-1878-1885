@@ -86,9 +86,9 @@ def test_landscape_pdf_explicit_single_is_not_bisected(tmp_path):
     rows, out, _ = run_first(tmp_path, 1878, im, 'single')
     assert rows[0]['status'] == 'accepted_single'
     folder = out / '1878'
-    assert (folder / 'p0001_single_100dpi.png').exists()
-    assert not (folder / 'p0001_left_100dpi.png').exists()
-    assert not (folder / 'p0001_right_100dpi.png').exists()
+    assert (folder / 'accepted' / 'p0001_single_100dpi.png').exists()
+    assert not (folder / 'accepted' / 'p0001_left_100dpi.png').exists()
+    assert not (folder / 'accepted' / 'p0001_right_100dpi.png').exists()
     assert (folder / 'review_contact_sheet.jpg').exists()
     with (folder / 'split_review.csv').open(newline='') as f:
         items = list(csv.DictReader(f))
@@ -106,8 +106,8 @@ def test_single_page_flows_into_second_table_split(tmp_path):
     assert result[0]['printed_side'] == 'single'
     assert result[0]['status'] == 'accepted', result[0]
     folder = output / '1878'
-    assert (folder / 'p0001_single_col1_100dpi.png').exists()
-    assert (folder / 'p0001_single_col2_100dpi.png').exists()
+    assert (folder / 'accepted' / 'p0001_single_col1_100dpi.png').exists()
+    assert (folder / 'accepted' / 'p0001_single_col2_100dpi.png').exists()
     assert (folder / 'review_contact_sheet.jpg').exists()
 
 
@@ -119,9 +119,9 @@ def test_spread_sides_not_overridden_and_no_single_pass_through(tmp_path):
     ar[40:height-30, 585:616] = 45
     rows, out, _ = run_first(tmp_path, 1882, Image.fromarray(ar), 'spread', sides=['right'])
     assert rows[0]['scan_layout'] == 'spread'
-    assert (out / '1882' / 'p0001_right_100dpi.png').exists()
-    assert not (out / '1882' / 'p0001_left_100dpi.png').exists()
-    assert not (out / '1882' / 'p0001_single_100dpi.png').exists()
+    assert (out / '1882' / 'accepted' / 'p0001_right_100dpi.png').exists()
+    assert not (out / '1882' / 'accepted' / 'p0001_left_100dpi.png').exists()
+    assert not (out / '1882' / 'accepted' / 'p0001_single_100dpi.png').exists()
 
 
 def test_tolerant_stage2_and_one_table_output_and_aggregate(tmp_path):

@@ -80,10 +80,10 @@ def test_splits_only_confirmed_pdf_pages_and_respects_boundary_sides(tmp_path):
                             inner_trim_fraction=0.)
     assert all(r["status"] == "accepted" for r in rows), rows
     out = root / "out" / "1882"
-    assert (out / "p0001_right_100dpi.png").exists()
-    assert not (out / "p0001_left_100dpi.png").exists()
-    assert (out / "p0002_left_100dpi.png").exists()
-    assert (out / "p0002_right_100dpi.png").exists()
+    assert (out / "accepted" / "p0001_right_100dpi.png").exists()
+    assert not (out / "accepted" / "p0001_left_100dpi.png").exists()
+    assert (out / "accepted" / "p0002_left_100dpi.png").exists()
+    assert (out / "accepted" / "p0002_right_100dpi.png").exists()
     assert (out / "review_contact_sheet.jpg").exists()
 
 

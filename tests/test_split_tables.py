@@ -294,14 +294,14 @@ def test_extreme_is_review_only_and_does_not_change_accepted_peers(tmp_path):
     assert by_page[495]['status'] == 'accepted_extreme_pending_review', by_page[495]
     assert by_page[495]['detection_pass'] == 'extreme'
     assert by_page[495]['cut_method'] == 'linear'
-    assert 'extreme_candidates' in by_page[495]['table_1']
+    assert 'needs_review' in by_page[495]['table_1']
     assert Path(by_page[495]['table_1']).exists()
     assert Path(by_page[495]['table_2']).exists()
     assert not (output/'1883'/'p0495_single_col1_100dpi.png').exists()
     for page in (491,493):
         assert by_page[page]['status']=='accepted', by_page[page]
         assert by_page[page]['detection_pass']=='strict'
-        assert 'extreme_candidates' not in by_page[page]['table_1']
+        assert 'accepted' in by_page[page]['table_1']
     with (output/'all_years_table_split_review.csv').open(newline='') as f:
         combined=list(csv.DictReader(f))
     assert len(combined)==3
@@ -396,7 +396,7 @@ def test_short_table_candidate_is_review_only_and_keeps_good_peer_crops(tmp_path
     assert short_row['detection_pass'] == 'short_table'
     assert float(short_row['active_table_bottom_fraction']) < .55
     assert short_row['table_count'] == 2
-    assert 'short_table_candidates' in short_row['table_1']
+    assert 'needs_review' in short_row['table_1']
     assert Path(short_row['table_1']).exists() and Path(short_row['table_2']).exists()
     assert not (output/'1881'/'p0466_single_col1_100dpi.png').exists()
     earlier = {p:hashlib.sha256(Path(by_page[p]['table_1']).read_bytes()).hexdigest()

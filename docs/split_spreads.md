@@ -95,3 +95,21 @@ For years marked `scan_layout: single`, the script saves an intact
 `pXXXX_single_<dpi>dpi.png` and includes it in the contact sheet. A single-page
 scan is never bisected. For configured spreads, `page_sides` controls which
 printed halves are relevant. The year-wide review remains in `derived/`.
+
+
+## v1.6: parallel runs and separate accepted / needs-review images
+
+The default gutter trim remains `--inner-trim .001` (0.1% of the original spread
+width). Run with `--workers 4` on a machine with sufficient RAM; `--workers 1`
+is the serial fallback. Each worker opens its own PDF document.
+
+Accepted output PNGs now go to `split_pages/{year}/accepted/`; problematic
+source scans and overlays go to `split_pages/{year}/needs_review/`. No ambiguous
+spread half becomes automatically available for Stage 2. Diagnostic previews
+of accepted scans remain in `previews/`. Contact sheets now also include a
+review-only version in `needs_review/review_contact_sheet.jpg`. For large years,
+contact sheets are paginated after 48 scans.
+
+The command prints a progress bar, elapsed time and ETA instead of listing
+every page, followed by a concise accepted/split/passthrough/review table.
+Partial `--pages` reruns retain the other PDF pages in the annual CSV.

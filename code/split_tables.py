@@ -11,6 +11,9 @@ From the repository root:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import contextlib
+import multiprocessing
 import csv
 import hashlib
 import re
@@ -22,11 +25,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from segmentation_runtime import Progress, contact_sheets, summary_tables
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_INPUT = ROOT / "derived" / "situation_financiere" / "split_pages"
 DEFAULT_OUTPUT = ROOT / "derived" / "situation_financiere" / "table_panels"
-VERSION = "layout_guided_table_split_v1_5"
+VERSION = "multiprocess_stage2_v1_6"
 PATTERN = re.compile(r"^p(?P<page>\d{4})_(?P<side>left|right|single)_(?P<dpi>\d+)dpi\.png$")
 
 
@@ -912,242 +918,262 @@ def _contact_sheet(files: list[Path], target: Path) -> None:
     sheet.save(target, quality=86)
 
 
+def _init_table_worker() -> None:
+    # Four independent OpenCV processes should not each create dozens of
+    # additional internal threads (oversubscription on an Intel Mac).
+    cv2.setNumThreads(1)
+
+
+def _detect_initial_task(task: tuple[int, str, Path]) -> tuple[Path, Separator]:
+    _, _, src = task
+    with Image.open(src) as image:
+        return src, detect_separator(image)
+
+
+def _run_table_task(task: tuple) -> dict:
+    (year, page, side, src, original, expected, out, dpi,
+     overlap_fraction, force_review, cut_mode, extreme, short_table) = task
+    with Image.open(src) as im:
+        image = im.convert('L')
+    result = original
+    single_table = detect_single_table_side(image)
+    if single_table is None and not original.accepted and expected is not None:
+        alternative = detect_separator_tolerant(image, expected)
+        if alternative is not None:
+            result = alternative
+    path = detect_cut_path(image, result, mode=cut_mode)
+    extreme_found = False
+    recovered_base = (not result.accepted and
+                      result.reason == 'curved_or_inconsistent_border_needs_review'
+                      and path.kind != 'vertical')
+    if (extreme and cut_mode == 'auto' and single_table is None
+            and not result.accepted and not recovered_base and expected is not None):
+        candidate = detect_separator_extreme(image, expected)
+        if candidate is not None:
+            result, path = candidate
+            extreme_found = True
+    short_found = False
+    if (short_table and cut_mode == 'auto' and single_table is None
+            and not result.accepted and not recovered_base
+            and not extreme_found and expected is not None):
+        short_candidate = detect_separator_short_table(image, expected, original)
+        if short_candidate is not None:
+            result, path = short_candidate
+            short_found = True
+    recovered = (not result.accepted and
+                 result.reason == 'curved_or_inconsistent_border_needs_review'
+                 and path.kind != 'vertical')
+    safe = result.accepted or recovered or single_table is not None
+    stem = f'p{page:04d}_{side}'
+    accepted_dir, review_dir, preview_dir = (out / 'accepted', out / 'needs_review',
+                                             out / 'previews')
+    for directory in (accepted_dir, review_dir, preview_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    # Never leave an OCR-ready accepted crop if the same page is later rejected.
+    for directory in (out, accepted_dir, review_dir,
+                      out / 'extreme_candidates', out / 'short_table_candidates'):
+        if directory.exists():
+            for old in directory.glob(f'{stem}_*'):
+                if old.is_file() and old.suffix.lower() in {'.png', '.jpg', '.pdf'}:
+                    old.unlink()
+    for old in preview_dir.glob(f'{stem}_*.jpg'):
+        old.unlink()
+    status = 'accepted' if safe else 'needs_review'
+    if single_table is not None:
+        status = 'accepted_single_table'
+    elif short_found:
+        status = 'accepted_short_table_pending_review'
+    elif extreme_found:
+        status = 'accepted_extreme_pending_review'
+    elif not safe and force_review:
+        status = 'provisional_review_only'
+    is_review = status not in {'accepted', 'accepted_single_table'}
+    target_dir = review_dir if is_review else accepted_dir
+    label = (f'{year} PDF p.{page} {side} | SHORT TABLE PENDING REVIEW' if short_found else
+             f'{year} PDF p.{page} {side} | EXTREME PENDING REVIEW' if extreme_found else
+             f'{year} PDF p.{page} {side}')
+    view = _preview(image, result, label,
+                    path, approved=safe and not (extreme_found or short_found),
+                    single_table=single_table)
+    view_path = (review_dir if is_review else preview_dir) / f'{stem}_separator.jpg'
+    view.save(view_path, quality=90)
+    first_path = second_path = ''
+    if single_table is not None:
+        index = 1 if single_table == 'left' else 2
+        file = accepted_dir / f'{stem}_col{index}_{dpi}dpi.png'
+        image.save(file)
+        if index == 1:
+            first_path = str(file)
+        else:
+            second_path = str(file)
+    elif safe or force_review:
+        first, second, _ = crop_tables_along_path(image, path, overlap_fraction)
+        first_file = target_dir / f'{stem}_col1_{dpi}dpi.png'
+        second_file = target_dir / f'{stem}_col2_{dpi}dpi.png'
+        first.save(first_file)
+        second.save(second_file)
+        first_path, second_path = str(first_file), str(second_file)
+    if is_review:
+        # Never leave an unresolved page invisible just because cutting failed.
+        image.save(review_dir / f'{stem}_source_{dpi}dpi.png')
+    return {'year': year, 'pdf_page': page, 'printed_side': side,
+            'status': status,
+            'reason': ('single_printed_table_only' if single_table else
+                       'recovered_curved_border' if recovered else result.reason),
+            'table_count': 1 if single_table else (2 if (safe or force_review) else 0),
+            'single_table_side': single_table or '',
+            'expected_cut_fraction': (round(expected, 6) if expected is not None else ''),
+            'detection_pass': ('single_table' if single_table else
+                               'short_table' if short_found else
+                               'extreme' if extreme_found else
+                               'tolerant' if result is not original else 'strict'),
+            'cut_method': 'none' if single_table else path.kind,
+            'cut_path_coefficients': ('' if single_table else
+                                      ';'.join(f'{v:.8g}' for v in path.coefficients)),
+            'cut_path_points': path.sample_count,
+            'cut_path_residual_fraction': (round(path.residual_fraction, 6)
+                                           if np.isfinite(path.residual_fraction) else ''),
+            'cut_path_max_shift_fraction': round(path.max_shift_fraction, 6),
+            'cut_path_reason': path.reason,
+            'active_table_top_fraction': (round((path.active_y_range[0]+1)/2, 6)
+                                          if path.active_y_range else ''),
+            'active_table_bottom_fraction': (round((path.active_y_range[1]+1)/2, 6)
+                                             if path.active_y_range else ''),
+            'cut_fraction': '' if single_table else round(result.fraction, 6),
+            'cut_x_px': '' if single_table else round(image.width * result.fraction),
+            'image_width_px': image.width,
+            'vertical_strength': round(result.strength, 5),
+            'header_rules_before': round(result.left_header_rules, 4),
+            'header_rules_after': round(result.right_header_rules, 4),
+            'second_candidate': round(result.second_strength, 5),
+            'confidence_heuristic': round(result.confidence, 4),
+            'border_drift_fraction': round(result.drift_fraction, 5),
+            'input_sha256': hashlib.sha256(src.read_bytes()).hexdigest(),
+            'source_image': str(src), 'table_1': first_path, 'table_2': second_path,
+            'preview': str(view_path), 'algorithm': VERSION}
+
+
 def split_year(*, year: int, pages: list[int] | None, dpi: int,
                input_root: Path = DEFAULT_INPUT, output_root: Path = DEFAULT_OUTPUT,
                overlap_fraction: float = .004, force_review: bool = False,
-               cut_mode: str = "auto", extreme: bool = True,
-               short_table: bool = True) -> list[dict]:
+               cut_mode: str = 'auto', extreme: bool = True,
+               short_table: bool = True, workers: int = 1) -> list[dict]:
+    if workers < 1:
+        raise ValueError('workers must be >= 1')
     folder = input_root / str(year)
     if not folder.is_dir():
-        raise FileNotFoundError(f"Missing first-stage outputs at {folder}; run code/split_spreads.py first")
+        raise FileNotFoundError(f'Missing first-stage outputs at {folder}')
     prior_status: dict[int, str] = {}
-    prior_manifest = folder / "split_review.csv"
+    prior_manifest = folder / 'split_review.csv'
     if prior_manifest.exists():
-        with prior_manifest.open(newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                if row.get("pdf_page") and row.get("status"):
-                    prior_status[int(row["pdf_page"])] = row["status"]
-    sources: list[tuple[int, str, Path]] = []
+        with prior_manifest.open(newline='', encoding='utf-8') as handle:
+            for row in csv.DictReader(handle):
+                if row.get('pdf_page') and row.get('status'):
+                    prior_status[int(row['pdf_page'])] = row['status']
+    # Read only Stage 1 accepted images. Legacy root-level images are supported
+    # during migration from the previous checkpoint, without double counting.
+    images: dict[tuple[int, str], Path] = {}
+    for src in sorted(folder.glob(f'p????_*_{dpi}dpi.png')):
+        match = PATTERN.fullmatch(src.name)
+        if match:
+            images[(int(match.group('page')), match.group('side'))] = src
+    for src in sorted((folder / 'accepted').glob(f'p????_*_{dpi}dpi.png')):
+        match = PATTERN.fullmatch(src.name)
+        if match:
+            images[(int(match.group('page')), match.group('side'))] = src
     reference_sources: list[tuple[int, str, Path]] = []
+    sources: list[tuple[int, str, Path]] = []
     wanted = set(pages) if pages else None
-    for source in sorted(folder.glob(f"p????_*_{dpi}dpi.png")):
-        m = PATTERN.fullmatch(source.name)
-        if m:
-            page = int(m.group("page"))
-            stage_1_status = prior_status.get(page, "missing_from_manifest") if prior_manifest.exists() else "accepted"
-            if stage_1_status not in {"accepted", "accepted_single"} and not force_review:
-                if wanted is None or page in wanted:
-                    print(f"{year} PDF p.{page} {m.group('side')}: skip; stage 1 status={stage_1_status}")
-                continue
-            reference_sources.append((page, m.group("side"), source))
-            if wanted is None or page in wanted:
-                sources.append((page, m.group("side"), source))
+    for (page, side), src in sorted(images.items()):
+        stage1_status = (prior_status.get(page, 'missing_from_manifest')
+                         if prior_manifest.exists() else 'accepted')
+        if stage1_status not in {'accepted', 'accepted_single'} and not force_review:
+            continue
+        reference_sources.append((page, side, src))
+        if wanted is None or page in wanted:
+            sources.append((page, side, src))
     if not sources:
-        raise FileNotFoundError(f"No first-stage PNGs in {folder} matching year={year}, pages={pages}, dpi={dpi}")
-    # Pass 1: gather original detections and learn only very stable per-year
-    # left/right (or odd/even) positions from confidently accepted pages.
-    initial: dict[Path, Separator] = {}
-    for _, _, source in reference_sources:
-        with Image.open(source) as image:
-            initial[source] = detect_separator(image)
-    priors = layout_priors(reference_sources, initial)
+        raise FileNotFoundError(f'No accepted first-stage PNGs for {year}, dpi={dpi}')
     out = output_root / str(year)
-    preview_dir = out / "previews"
-    preview_dir.mkdir(parents=True, exist_ok=True)
-    rows: list[dict] = []
-    previews: list[Path] = []
-    for page, side, src in sources:
-        with Image.open(src) as im:
-            image = im.convert("L")
-        original = initial[src]
-        expected = priors.get(layout_bucket(page, side))
-        result = original
-        # A genuinely empty parallel half takes precedence, even when the
-        # old header detector mistakes the last rule of the populated table
-        # for a central two-table boundary.
-        single_table = detect_single_table_side(image)
-        # Pass 2 is only attempted for original failures and must independently
-        # identify printed-rule evidence. A prior alone cannot create a cut.
-        if single_table is None and not original.accepted and expected is not None:
-            alternative = detect_separator_tolerant(image, expected)
-            if alternative is not None:
-                result = alternative
-        path = detect_cut_path(image, result, mode=cut_mode)
-        # Pass 3: untouched by normal successes; expanded vertical, linear and
-        # quadratic hypotheses are attempted only after both earlier passes
-        # have failed. They always require visible rule evidence.
-        extreme_found = False
-        recovered_base = (not result.accepted and
-                          result.reason == "curved_or_inconsistent_border_needs_review"
-                          and path.kind != "vertical")
-        if (extreme and cut_mode == "auto" and single_table is None
-                and not result.accepted and not recovered_base and expected is not None):
-            candidate = detect_separator_extreme(image, expected)
-            if candidate is not None:
-                result, path = candidate
-                extreme_found = True
-        # Pass 4: only previously unresolved pages, and only when the scan
-        # visibly has two parallel printed tables ending in its upper portion.
-        # This does not change any pass 1-3 decisions or their crop geometry.
-        short_found = False
-        if (short_table and cut_mode == "auto" and single_table is None
-                and not result.accepted and not recovered_base
-                and not extreme_found and expected is not None):
-            short_candidate = detect_separator_short_table(image, expected, original)
-            if short_candidate is not None:
-                result, path = short_candidate
-                short_found = True
-        # Only the specific old rejection for excessive border drift may be
-        # recovered by a well-supported fit. Never override weak/ambiguous
-        # table identification.
-        recovered = (not result.accepted and
-                     result.reason == "curved_or_inconsistent_border_needs_review" and
-                     path.kind != "vertical")
-        safe = result.accepted or recovered or single_table is not None
-        stem = f"p{page:04d}_{side}"
-        label = (f"{year} PDF p.{page} {side} | SHORT TABLE PENDING REVIEW"
-                 if short_found else
-                 f"{year} PDF p.{page} {side} | EXTREME PENDING REVIEW"
-                 if extreme_found else f"{year} PDF p.{page} {side}")
-        view = _preview(image, result, label,
-                        path, approved=safe and not (extreme_found or short_found),
-                        single_table=single_table)
-        view_path = preview_dir / f"{stem}_separator.jpg"
-        view.save(view_path, quality=90)
-        previews.append(view_path)
-        first_path = second_path = ""
-        # Clean up candidate images from passes not selected this run. Never
-        # leave stale review-only crops that could be mistaken for new output.
-        for candidate_dir, selected in (("extreme_candidates", extreme_found),
-                                        ("short_table_candidates", short_found)):
-            if not selected:
-                for n in (1, 2):
-                    stale = out / candidate_dir / f"{stem}_col{n}_{dpi}dpi.png"
-                    if stale.exists():
-                        stale.unlink()
-        status = "accepted" if safe else "needs_review"
-        if single_table is not None:
-            # If only one parallel table is present, retain the *full* printed
-            # page as its one OCR image. No fabricated second-table crop.
-            table_index = 1 if single_table == "left" else 2
-            table_file = out / f"{stem}_col{table_index}_{dpi}dpi.png"
-            image.save(table_file)
-            if table_index == 1:
-                first_path = str(table_file)
-            else:
-                second_path = str(table_file)
-            absent_index = 3-table_index
-            stale = out / f"{stem}_col{absent_index}_{dpi}dpi.png"
-            if stale.exists():
-                stale.unlink()
-            status = "accepted_single_table"
-        elif safe or force_review:
-            first, second, _ = crop_tables_along_path(image, path, overlap_fraction)
-            # Never include unverified extreme candidates in the ordinary
-            # production table-image folder. OCR should not consume these
-            # until a human approves their cut boundaries.
-            destination = (out / "short_table_candidates" if short_found else
-                           out / "extreme_candidates" if extreme_found else out)
-            destination.mkdir(parents=True, exist_ok=True)
-            first_file = destination / f"{stem}_col1_{dpi}dpi.png"
-            second_file = destination / f"{stem}_col2_{dpi}dpi.png"
-            first.save(first_file)
-            second.save(second_file)
-            first_path, second_path = str(first_file), str(second_file)
-            if extreme_found or short_found:
-                status = ("accepted_short_table_pending_review" if short_found
-                          else "accepted_extreme_pending_review")
-                for n in (1, 2):
-                    old = out / f"{stem}_col{n}_{dpi}dpi.png"
-                    if old.exists():
-                        old.unlink()
-            elif not safe:
-                status = "provisional_review_only"
+    out.mkdir(parents=True, exist_ok=True)
+    prog_detect = Progress(f'{year} | Stage 2 detect', len(reference_sources))
+    initial: dict[Path, Separator] = {}
+    context = (concurrent.futures.ProcessPoolExecutor(
+        max_workers=workers, mp_context=multiprocessing.get_context('spawn'),
+        initializer=_init_table_worker) if workers > 1 else contextlib.nullcontext())
+    with context as pool:
+        if pool is None:
+            _init_table_worker()
+            for item in reference_sources:
+                src, result = _detect_initial_task(item)
+                initial[src] = result
+                prog_detect.update()
         else:
-            # If a previous run accepted a page but a new run does not, remove
-            # stale output so it cannot be passed to Mistral inadvertently.
-            for n in (1, 2):
-                stale = out / f"{stem}_col{n}_{dpi}dpi.png"
-                if stale.exists():
-                    stale.unlink()
-        row = {"year": year, "pdf_page": page, "printed_side": side,
-               "status": status,
-               "reason": ("single_printed_table_only" if single_table
-                          else "recovered_curved_border" if recovered else result.reason),
-               "table_count": 1 if single_table else (2 if (safe or force_review) else 0),
-               "single_table_side": single_table or "",
-               "expected_cut_fraction": (round(expected, 6) if expected is not None else ""),
-               "detection_pass": ("single_table" if single_table else
-                                  "short_table" if short_found else "extreme"
-                                  if extreme_found else
-                                  "tolerant" if result is not original else "strict"),
-               "cut_method": "none" if single_table else path.kind,
-               "cut_path_coefficients": ("" if single_table
-                                         else ";".join(f"{v:.8g}" for v in path.coefficients)),
-               "cut_path_points": path.sample_count,
-               "cut_path_residual_fraction": (round(path.residual_fraction, 6)
-                                               if np.isfinite(path.residual_fraction) else ""),
-               "cut_path_max_shift_fraction": round(path.max_shift_fraction, 6),
-               "cut_path_reason": path.reason,
-               "active_table_top_fraction": (round((path.active_y_range[0]+1)/2, 6)
-                                             if path.active_y_range else ""),
-               "active_table_bottom_fraction": (round((path.active_y_range[1]+1)/2, 6)
-                                                if path.active_y_range else ""),
-               "cut_fraction": "" if single_table else round(result.fraction, 6),
-               "cut_x_px": "" if single_table else round(image.width * result.fraction),
-               "image_width_px": image.width,
-               "vertical_strength": round(result.strength, 5),
-               "header_rules_before": round(result.left_header_rules, 4),
-               "header_rules_after": round(result.right_header_rules, 4),
-               "second_candidate": round(result.second_strength, 5),
-               "confidence_heuristic": round(result.confidence, 4),
-               "border_drift_fraction": round(result.drift_fraction, 5),
-               "input_sha256": hashlib.sha256(src.read_bytes()).hexdigest(),
-               "source_image": str(src), "table_1": first_path, "table_2": second_path,
-               "preview": str(view_path), "algorithm": VERSION}
-        rows.append(row)
-        summary = (f"single table on {single_table}" if single_table else
-                   f"cut={100*result.fraction:.2f}%, method={path.kind}, "
-                   f"pass={row['detection_pass']}, line={result.strength:.3f}"
-                   if result.strength else result.reason)
-        print(f"{year} PDF p.{page} {side}: {status}, {summary}")
-    fields = ["year", "pdf_page", "printed_side", "status", "reason", "table_count",
-              "single_table_side", "expected_cut_fraction", "detection_pass", "cut_method",
-              "cut_path_coefficients", "cut_path_points", "cut_path_residual_fraction",
-              "cut_path_max_shift_fraction", "cut_path_reason",
-              "active_table_top_fraction", "active_table_bottom_fraction", "cut_fraction",
-              "cut_x_px", "image_width_px", "vertical_strength", "header_rules_before",
-              "header_rules_after", "second_candidate", "confidence_heuristic",
-              "border_drift_fraction", "input_sha256",
-              "source_image", "table_1", "table_2", "preview", "algorithm"]
-    report = out / "table_split_review.csv"
+            futures = [pool.submit(_detect_initial_task, item) for item in reference_sources]
+            for future in concurrent.futures.as_completed(futures):
+                src, result = future.result()
+                initial[src] = result
+                prog_detect.update()
+        priors = layout_priors(reference_sources, initial)
+        jobs = [(year, page, side, src, initial[src],
+                 priors.get(layout_bucket(page, side)), out, dpi,
+                 overlap_fraction, force_review, cut_mode, extreme, short_table)
+                for page, side, src in sources]
+        rows: list[dict] = []
+        prog_split = Progress(f'{year} | Stage 2 split', len(jobs))
+        if pool is None:
+            for job in jobs:
+                rows.append(_run_table_task(job))
+                prog_split.update()
+        else:
+            futures = [pool.submit(_run_table_task, job) for job in jobs]
+            for future in concurrent.futures.as_completed(futures):
+                rows.append(future.result())
+                prog_split.update()
+    fields = ['year', 'pdf_page', 'printed_side', 'status', 'reason', 'table_count',
+              'single_table_side', 'expected_cut_fraction', 'detection_pass', 'cut_method',
+              'cut_path_coefficients', 'cut_path_points', 'cut_path_residual_fraction',
+              'cut_path_max_shift_fraction', 'cut_path_reason',
+              'active_table_top_fraction', 'active_table_bottom_fraction', 'cut_fraction',
+              'cut_x_px', 'image_width_px', 'vertical_strength', 'header_rules_before',
+              'header_rules_after', 'second_candidate', 'confidence_heuristic',
+              'border_drift_fraction', 'input_sha256', 'source_image',
+              'table_1', 'table_2', 'preview', 'algorithm']
+    report = out / 'table_split_review.csv'
     if wanted is not None and report.exists():
-        # Rechecking a few pages should not erase already reviewed records
-        # for other pages. The aggregate retains all known pages as well.
-        seen = {(int(row["pdf_page"]), row["printed_side"]) for row in rows}
-        with report.open(newline="", encoding="utf-8") as old:
-            for previous in csv.DictReader(old):
-                key = (int(previous["pdf_page"]), previous["printed_side"])
-                if key not in seen and key[0] not in wanted:
+        keys = {(int(r['pdf_page']), r['printed_side']) for r in rows}
+        with report.open(newline='', encoding='utf-8') as handle:
+            for previous in csv.DictReader(handle):
+                key = (int(previous['pdf_page']), previous['printed_side'])
+                if key not in keys and key[0] not in wanted:
                     rows.append(previous)
-        rows.sort(key=lambda r: (int(r["pdf_page"]),
-                                 {"single":0,"left":1,"right":2}.get(r["printed_side"],9)))
-    with report.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=fields)
+    rows.sort(key=lambda r: (int(r['pdf_page']),
+                             {'single':0, 'left':1, 'right':2}.get(r['printed_side'],9)))
+    with report.open('w', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction='ignore')
         writer.writeheader()
         writer.writerows(rows)
-    _contact_sheet(previews, out / "review_contact_sheet.jpg")
-    aggregate = aggregate_review_csvs(output_root)
-    print(f"Review CSV: {report}")
-    print(f"All-years review CSV: {aggregate}")
-    print(f"Contact sheet: {out / 'review_contact_sheet.jpg'}")
-    print("No OCR was performed. Review the central separator before using these crops with Mistral.")
+    all_previews = [Path(r['preview']) for r in rows if r.get('preview')]
+    pending_previews = [Path(r['preview']) for r in rows
+                        if r.get('status') not in {'accepted', 'accepted_single_table'} and r.get('preview')]
+    contact_sheets(all_previews, out, name='review_contact_sheet', tile=(500,600))
+    contact_sheets(pending_previews, out / 'needs_review',
+                   name='review_contact_sheet', tile=(500,600))
+    summary_tables(rows, prog_detect.elapsed + prog_split.elapsed)
+    print(f'Review CSV: {report}')
+    print(f'All-years review CSV: {aggregate_review_csvs(output_root)}')
+    print(f'Accepted PNGs: {out / "accepted"}')
+    print(f'Needs-review PNGs/previews: {out / "needs_review"}')
+    print('No OCR was performed.')
     return rows
+
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--year", type=int)
+    parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1),
+                        help="parallel worker processes (default: up to 4, use 1 for serial)")
     parser.add_argument("--combine-only", action="store_true",
                         help="Regenerate the all-years CSV from existing annual reports, without processing images")
     parser.add_argument("--pages", nargs="+", type=int, default=None,
@@ -1178,7 +1204,7 @@ def main() -> None:
                input_root=args.input_root, output_root=args.output_root,
                overlap_fraction=args.overlap, force_review=args.force_review,
                cut_mode=args.cut_mode, extreme=args.extreme,
-               short_table=args.short_table)
+               short_table=args.short_table, workers=args.workers)
 
 
 if __name__ == "__main__":
