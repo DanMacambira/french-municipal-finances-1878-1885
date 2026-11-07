@@ -584,21 +584,45 @@ def parse_cache(years: list[int] | None = None, dpi: int = 200) -> tuple[pd.Data
     return (raw_frame, candidate_frame,
             pd.DataFrame(inventory), pd.DataFrame(page_audit))
 
-
 def apply_commune_match(df: pd.DataFrame) -> pd.DataFrame:
-    """Uses your existing code/commune_matcher.py and communematch package."""
+    """Translate OCR commune names through the existing external communematch engine.
+
+    Preserve original OCR text, row IDs, every candidate (including unmatched),
+    and all fiscal variables.  Clean the query only; never rewrite the source.
+    """
     try:
         import commune_matcher as cm
     except ImportError as exc:
-        raise RuntimeError("Install your project's 'communematch' dependency, or use --no-match") from exc
+        raise RuntimeError("Cannot import code/commune_matcher.py") from exc
+    if "commune_raw" not in df.columns:
+        raise ValueError("Missing commune_raw column in OCR candidate frame")
     matcher = cm.get_matcher()
-    matched = matcher.translate_frame(df.copy(), column="commune_raw")
-    matched = matched.rename(columns={"cm_id": "cassini_id", "cm_name": "commune_cleaned"})
-    if "cassini_id" not in matched:
-        raise RuntimeError("commune_matcher did not return cm_id; check package version")
-    matched["cassini_id"] = pd.to_numeric(matched["cassini_id"], errors="coerce").astype("Int64")
-    return matched
-
+    query = df.copy()
+    query["_commune_match_query"] = (
+        query["commune_raw"]
+        .astype("string")
+        .str.strip()
+        .str.replace(r"^'+|'+$", "", regex=True)
+        .str.replace(r"\(.*$", "", regex=True)
+        .str.strip()
+    )
+    translated = matcher.translate_frame(query, column="_commune_match_query")
+    if not isinstance(translated, pd.DataFrame) or len(translated) != len(df):
+        raise RuntimeError("commune_matcher unexpectedly changed the number of rows")
+    if "row_id" in df.columns:
+        if "row_id" not in translated.columns or \
+                translated["row_id"].astype(str).tolist() != df["row_id"].astype(str).tolist():
+            raise RuntimeError("commune_matcher changed row order; refusing to misalign OCR values")
+    required = {"cm_id", "cm_name"}
+    if not required.issubset(translated.columns):
+        raise RuntimeError("commune_matcher must return cm_id and cm_name")
+    result = translated.rename(columns={"cm_id": "cassini_id", "cm_name": "commune_cleaned"})
+    result["cassini_id"] = pd.to_numeric(result["cassini_id"], errors="coerce").astype("Int64")
+    # Keep only meaningful matcher outputs. cm_status is valuable for QA.
+    discard = [c for c in result.columns if
+               (c.startswith("cm_") and c != "cm_status") or c == "_commune_match_query"]
+    result = result.drop(columns=discard)
+    return result
 
 def export_frame(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
