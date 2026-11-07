@@ -722,6 +722,10 @@ def main() -> None:
                            help="OCR selected 1-based PDF page numbers within each confirmed range")
             q.add_argument("--yes-all", action="store_true", help="Required for a paid full-range run")
             q.add_argument("--force", action="store_true", help="Replace cached responses")
+            q.add_argument("--workers", type=int, default=1,
+                           help="Concurrent OCR requests (1=original sequential; try 4)")
+            q.add_argument("--rpm", type=float, default=0.0,
+                           help="Optional maximum new OCR job starts/minute (0=unpaced)")
         if cmd == "build":
             q.add_argument("--no-match", action="store_true", help="Skip communematch temporarily")
             q.add_argument("--min-confidence", type=float, default=0.75)
@@ -733,7 +737,13 @@ def main() -> None:
     elif args.command == "ocr":
         if args.max_pages < 0:
             p.error("--max-pages must be >= 0")
-        ocr(args)
+        if args.workers > 1:
+            from parallel_ocr import parallel_ocr
+            parallel_ocr(args)
+        elif args.workers == 1:
+            ocr(args)
+        else:
+            p.error("--workers must be positive")
     else:
         build(args)
 

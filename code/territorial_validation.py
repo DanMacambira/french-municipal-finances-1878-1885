@@ -178,7 +178,7 @@ def annotate_territories(raw_rows: pd.DataFrame, communes: pd.DataFrame):
 
 def _region_order(region: str) -> int:
     """Physical reading order of OCR regions on a source PDF page."""
-    order = {"full": 0, "full_col1": 0, "full_col2": 1,
+    order = {"single": 0, "full": 0, "full_col1": 0, "full_col2": 1,
              "left": 0, "left_col1": 0, "left_col2": 1,
              "right": 2, "right_col1": 2, "right_col2": 3}
     if region not in order:
